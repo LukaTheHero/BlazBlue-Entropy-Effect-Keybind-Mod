@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Luka.BBEE.KeybindMod;
 
@@ -28,12 +29,24 @@ public static class CharacterCatalog
         new(103801, "beheaded", "Beheaded"),
     };
 
+    private static readonly HashSet<int> DedicatedPresetActors = new()
+    {
+        100401, // Rachel
+        101801, // Platinum
+        102801, // No.11
+        100301, // Noel
+        103701, // Icey
+    };
+
     private static readonly Dictionary<int, CharacterMeta> ById = Roster.ToDictionary(c => c.ActorId);
     private static readonly Dictionary<int, List<MoveDefinition>> MovesByActor = new();
 
+    private static readonly Regex ActionTagRegex = new(@"<action=([^>]+)>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex BranchSplitRegex = new(@"\s+\bor\b\s+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     static CharacterCatalog()
     {
-        ResetToPresets();
+        ResetToPresets(includeFallbackStandardCombos: true);
     }
 
     public static CharacterMeta? FindCharacter(int actorId) => ById.TryGetValue(actorId, out var c) ? c : null;
@@ -45,7 +58,7 @@ public static class CharacterCatalog
         return MovesByActor.TryGetValue(actorId, out var list) ? list : Array.Empty<MoveDefinition>();
     }
 
-    public static void ResetToPresets()
+    public static void ResetToPresets(bool includeFallbackStandardCombos = true)
     {
         MovesByActor.Clear();
         foreach (var ch in Roster)
@@ -56,63 +69,117 @@ public static class CharacterCatalog
         AddLambdaPresets(MovesByActor[102801]);
         AddNoelPresets(MovesByActor[100301]);
         AddIceyPresets(MovesByActor[103701]);
-        AddTaokakaPresets(MovesByActor[100501]);
-        AddHibikiPresets(MovesByActor[102901]);
 
-        foreach (var ch in Roster)
+        if (includeFallbackStandardCombos)
         {
-            if (MovesByActor[ch.ActorId].Count == 0)
-                AddStandardCombos(MovesByActor[ch.ActorId], ch.ActorId, ch.Key);
+            foreach (var ch in Roster)
+            {
+                if (!DedicatedPresetActors.Contains(ch.ActorId))
+                    AddStandardCombos(MovesByActor[ch.ActorId], ch.ActorId, ch.Key);
+            }
         }
     }
 
     public static void MergeDiscoveredCatalog(RuntimeStateSnapshot snapshot)
     {
-        ResetToPresets();
+        ResetToPresets(includeFallbackStandardCombos: false);
 
-        foreach (var kvp in snapshot.DiscoveredActionsByActor)
+        foreach (var ch in Roster)
         {
-            if (!MovesByActor.TryGetValue(kvp.Key, out var list))
+            if (!snapshot.DiscoveredActionsByActor.TryGetValue(ch.ActorId, out var rawActions) || rawActions.Count == 0)
             {
-                list = new List<MoveDefinition>();
-                MovesByActor[kvp.Key] = list;
+                if (!DedicatedPresetActors.Contains(ch.ActorId))
+                    AddStandardCombos(MovesByActor[ch.ActorId], ch.ActorId, ch.Key);
+                continue;
             }
 
-            var seenSignatures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var preset in list)
-                seenSignatures.Add(BuildCanonicalSignature(preset));
+            var list = MovesByActor[ch.ActorId];
 
-            foreach (var act in kvp.Value)
+            // Track presets by canonical key so real ActorActionConf entries enrich them without duplicating
+            var unmatchedPresets = new List<(MoveDefinition Move, string Canonical)>();
+            foreach (var p in list)
             {
-                // Skip pure 1-button moves unless directional+button (game already binds 1-button inputs)
-                var steps = ParseButtonSequence(act.Buttons, out var hint, out var isMultiInput);
-                if (steps == null || !isMultiInput)
+                if (p.Category == MoveCategory.SpellChant)
+                    continue;
+                unmatchedPresets.Add((p, BuildPresetCanonicalKey(p)));
+            }
+
+            var seenDiscovered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool assignedLegacyDodge = list.Any(m => m.Id.EndsWith(".dodge_attack", StringComparison.OrdinalIgnoreCase));
+
+            foreach (var act in rawActions)
+            {
+                if (string.IsNullOrWhiteSpace(act.InputRaw))
                     continue;
 
-                var sig = string.Join("+", act.Buttons);
-                if (seenSignatures.Contains(sig))
+                var steps = ParseLocalizedInput(act.InputRaw, out var hint, out var isEligible, out var requiresAirborne, out var canonicalKey);
+                if (steps == null || !isEligible)
                     continue;
 
-                seenSignatures.Add(sig);
+                // Attach first matching discovered row onto matching preset if any
+                bool attachedToPreset = false;
+                for (int i = 0; i < unmatchedPresets.Count; i++)
+                {
+                    var (preset, presetCanon) = unmatchedPresets[i];
+                    if (preset.ActionConfId == 0 && CanonicalKeysMatch(presetCanon, canonicalKey))
+                    {
+                        preset.ActionConfId = act.Id;
+                        preset.IsBaseMove = act.IsBase;
+                        preset.RequiredPotentialIds = act.PotentialIds;
+                        preset.RequiredPotentialId = act.PotentialIds.Length > 0 ? act.PotentialIds[0] : 0u;
+                        preset.ComboPotentialSets = act.ComboPotentialSets;
+                        preset.ReplacesActionIds = act.Replace;
+                        if (!string.IsNullOrWhiteSpace(act.Description))
+                            preset.Description = act.Description;
+                        attachedToPreset = true;
+                        break;
+                    }
+                }
+
+                if (attachedToPreset)
+                    continue;
+
                 string title = !string.IsNullOrWhiteSpace(act.Name)
                     ? act.Name
                     : BuildFallbackActionName(act, hint);
 
+                string dedupeKey = $"{canonicalKey}||{title.Trim()}";
+                if (!seenDiscovered.Add(dedupeKey))
+                    continue;
+
+                string moveId = $"action.{ch.ActorId}.{act.Id}";
+                if (!assignedLegacyDodge
+                    && act.IsBase
+                    && (string.Equals(canonicalKey, "Dash->Attack", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(canonicalKey, "Attack+Dash", StringComparison.OrdinalIgnoreCase)))
+                {
+                    moveId = $"{ch.Key}.dodge_attack";
+                    assignedLegacyDodge = true;
+                }
+
+                string desc = !string.IsNullOrWhiteSpace(act.Description)
+                    ? act.Description
+                    : (act.PotentialIds.Length > 0
+                        ? $"Unlocked by Potential #{act.PotentialIds[0]}"
+                        : (act.IsBase ? "Base character move" : "Combo Potential skill"));
+
                 list.Add(new MoveDefinition
                 {
-                    Id = $"action.{kvp.Key}.{act.Id}",
-                    ActorId = kvp.Key,
+                    Id = moveId,
+                    ActorId = ch.ActorId,
                     Name = title,
                     ComboHint = hint,
-                    Description = act.FromPotential > 0
-                        ? $"Potential #{act.FromPotential} skill combo"
-                        : "Base multi-button move combo",
+                    Description = desc,
                     Category = MoveCategory.Discovered,
-                    RequiredPotentialId = act.FromPotential,
+                    IsBaseMove = act.IsBase,
+                    RequiredPotentialId = act.PotentialIds.Length > 0 ? act.PotentialIds[0] : 0u,
+                    RequiredPotentialIds = act.PotentialIds,
+                    ComboPotentialSets = act.ComboPotentialSets,
+                    RequiresAirborne = requiresAirborne,
                     ReplacesActionIds = act.Replace,
                     ActionConfId = act.Id,
                     IsPreset = false,
-                    SortOrder = 1000 + act.SortOrder,
+                    SortOrder = (act.IsBase ? 200 : 1000) + act.SortOrder,
                     Steps = steps
                 });
             }
@@ -123,18 +190,95 @@ public static class CharacterCatalog
 
     private static string BuildFallbackActionName(DiscoveredActionInfo act, string hint)
     {
+        if (!string.IsNullOrWhiteSpace(act.Description))
+        {
+            var clause = act.Description.Split(new[] { '.', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim();
+            if (!string.IsNullOrEmpty(clause))
+            {
+                if (clause.Length > 34)
+                    clause = clause.Substring(0, 31).TrimEnd() + "...";
+                return clause;
+            }
+        }
+
         if (act.Labels != null && act.Labels.Length > 0)
         {
             var clean = string.Join(" ", act.Labels.Where(l => !string.IsNullOrWhiteSpace(l))).Trim();
             if (!string.IsNullOrEmpty(clean) && !clean.Contains("_"))
                 return clean;
         }
-        return act.IsUltra ? $"Ultra Combo ({hint})" : $"Combo: {hint}";
+
+        return act.IsUltra ? $"Ultra: {hint}" : hint;
     }
 
-    private static string BuildCanonicalSignature(MoveDefinition move)
+    private static string NormalizeCompatKey(string k)
     {
-        return move.ComboHint;
+        if (string.Equals(k, "Attack+Dash", StringComparison.OrdinalIgnoreCase))
+            return "Dash->Attack";
+        if (string.Equals(k, "Dash+Skill", StringComparison.OrdinalIgnoreCase))
+            return "Dash->Skill";
+        return k;
+    }
+
+    private static bool CanonicalKeysMatch(string presetCanon, string discoveredCanon) =>
+        string.Equals(NormalizeCompatKey(presetCanon), NormalizeCompatKey(discoveredCanon), StringComparison.OrdinalIgnoreCase);
+
+    private static string BuildPresetCanonicalKey(MoveDefinition move)
+    {
+        var partTokens = new List<string>();
+        VirtualDir? heldDir = null;
+        var currentActs = new List<string>();
+        bool hasDashAttack = false;
+
+        foreach (var step in move.Steps)
+        {
+            if (step.Type == InputStepType.HoldDir)
+            {
+                if (step.Dir != VirtualDir.Neutral)
+                    heldDir = step.Dir;
+            }
+            else if (step.Type == InputStepType.ReleaseDir)
+            {
+                if (currentActs.Count > 0 || heldDir.HasValue)
+                {
+                    FlushPart(partTokens, heldDir, currentActs);
+                    heldDir = null;
+                }
+            }
+            else if (step.Type == InputStepType.Press)
+            {
+                string tok = step.Action.ToString();
+                if (!currentActs.Contains(tok))
+                    currentActs.Add(tok);
+                if (step.Action == InputActionKind.Dash)
+                    hasDashAttack = true;
+            }
+            else if (step.Type == InputStepType.Release && step.Action == InputActionKind.Dash && hasDashAttack && currentActs.Count > 0)
+            {
+                FlushPart(partTokens, heldDir, currentActs);
+                heldDir = null;
+            }
+        }
+
+        FlushPart(partTokens, heldDir, currentActs);
+
+        // Normalize Rachel Frog-Bat vs Up+Dash+Dash etc.
+        var body = string.Join("->", partTokens);
+        return move.RequiresAirborne ? $"air:{body}" : body;
+    }
+
+    private static void FlushPart(List<string> partTokens, VirtualDir? dir, List<string> acts)
+    {
+        if (!dir.HasValue && acts.Count == 0)
+            return;
+
+        var sorted = new List<string>(acts);
+        sorted.Sort(StringComparer.OrdinalIgnoreCase);
+        if (dir.HasValue)
+            sorted.Insert(0, dir.Value.ToString());
+
+        partTokens.Add(string.Join("+", sorted));
+        acts.Clear();
     }
 
     private static void AddRachelPresets(List<MoveDefinition> list)
@@ -147,6 +291,7 @@ public static class CharacterCatalog
             ComboHint = "Up + Attack",
             Description = "W Hold (111ms) -> Attack (59ms) -> 387ms recovery.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 10,
             Steps = new()
@@ -169,6 +314,7 @@ public static class CharacterCatalog
             ComboHint = "Up + 2x Dash",
             Description = "W Hold (60ms) -> Double Dash tap (60ms/90ms) -> 120ms.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 20,
             Steps = new()
@@ -195,6 +341,7 @@ public static class CharacterCatalog
             ComboHint = "Up + Skill",
             Description = "W Hold (40ms) -> Skill (50ms) -> 40ms.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 30,
             Steps = new()
@@ -219,6 +366,7 @@ public static class CharacterCatalog
             ComboHint = "Down + Attack",
             Description = "S Hold (111ms) -> Attack (59ms) -> 387ms recovery.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 50,
             Steps = new()
@@ -233,17 +381,20 @@ public static class CharacterCatalog
             }
         });
 
+        uint[] rachelChantPot = { 6442 };
+
         list.Add(CreateChantSpell(
             id: "rachel.tornado",
             actorId: 100401,
             name: "Tornado (Spell Chant)",
-            hint: "Special -> U, L, R, D, L, R, U",
+            hint: "SP -> U, L, R, D, L, R, U",
             desc: "Performs full casting animation with 10ms directional taps.",
             startupMs: 30,
             tapHoldMs: 10,
             tapGapMs: 10,
             postHoldMs: 20,
             sortOrder: 60,
+            requiredPotentials: rachelChantPot,
             VirtualDir.Up, VirtualDir.Left, VirtualDir.Right, VirtualDir.Down,
             VirtualDir.Left, VirtualDir.Right, VirtualDir.Up));
 
@@ -251,15 +402,58 @@ public static class CharacterCatalog
             id: "rachel.invincibility",
             actorId: 100401,
             name: "Invincibility (Spell Chant)",
-            hint: "Special -> U, U, D, D, L, R, L, R",
+            hint: "SP -> U, U, D, D, L, R, L, R",
             desc: "Performs full casting animation with 10ms directional taps.",
             startupMs: 30,
             tapHoldMs: 10,
             tapGapMs: 10,
             postHoldMs: 20,
             sortOrder: 70,
+            requiredPotentials: rachelChantPot,
             VirtualDir.Up, VirtualDir.Up, VirtualDir.Down, VirtualDir.Down,
             VirtualDir.Left, VirtualDir.Right, VirtualDir.Left, VirtualDir.Right));
+
+        list.Add(CreateChantSpell(
+            id: "rachel.summon_pumpkin",
+            actorId: 100401,
+            name: "Summon Pumpkin (Spell Chant)",
+            hint: "SP -> D, L, D, R, U",
+            desc: "Chant spell: Summons giant Pumpkin.",
+            startupMs: 30,
+            tapHoldMs: 10,
+            tapGapMs: 10,
+            postHoldMs: 20,
+            sortOrder: 75,
+            requiredPotentials: rachelChantPot,
+            VirtualDir.Down, VirtualDir.Left, VirtualDir.Down, VirtualDir.Right, VirtualDir.Up));
+
+        list.Add(CreateChantSpell(
+            id: "rachel.summon_bat",
+            actorId: 100401,
+            name: "Summon Bat (Spell Chant)",
+            hint: "SP -> U, L, U, R, D",
+            desc: "Chant spell: Summons George bats.",
+            startupMs: 30,
+            tapHoldMs: 10,
+            tapGapMs: 10,
+            postHoldMs: 20,
+            sortOrder: 80,
+            requiredPotentials: rachelChantPot,
+            VirtualDir.Up, VirtualDir.Left, VirtualDir.Up, VirtualDir.Right, VirtualDir.Down));
+
+        list.Add(CreateChantSpell(
+            id: "rachel.chant_buff",
+            actorId: 100401,
+            name: "Wind Chant Buff (Spell Chant)",
+            hint: "SP -> L, D, R, U",
+            desc: "Chant spell: Grants wind chant buff.",
+            startupMs: 30,
+            tapHoldMs: 10,
+            tapGapMs: 10,
+            postHoldMs: 20,
+            sortOrder: 85,
+            requiredPotentials: rachelChantPot,
+            VirtualDir.Left, VirtualDir.Down, VirtualDir.Right, VirtualDir.Up));
     }
 
     private static void AddPlatinumPresets(List<MoveDefinition> list)
@@ -270,8 +464,9 @@ public static class CharacterCatalog
             ActorId = 101801,
             Name = "Surf Dodge Attack",
             ComboHint = "Down + Dash",
-            Description = "Down (30ms) -> Dash (40ms) -> 30ms.",
+            Description = "Down (30ms) -> Dash (40ms) -> 30ms. Hold A/D to steer.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 10,
             Steps = new()
@@ -289,17 +484,20 @@ public static class CharacterCatalog
         list.Add(CreateDodgeAttack("platinum.normal_dodge", 101801, 20, "Normal Dodge Attack"));
         list.Add(CreateHeavyDodgeAttack("platinum.heavy_dodge", 101801, 30, "Heavy Dodge Attack"));
 
+        uint[] platChantPot = { 5222 };
+
         list.Add(CreateChantSpell(
             id: "platinum.angelic_blast",
             actorId: 101801,
             name: "Angelic Blast (Spell Chant)",
-            hint: "Special (280ms) -> (L, R) x4",
+            hint: "SP (280ms) -> (L, R) x4",
             desc: "Performs authentic 280ms chant startup + 55ms directional taps.",
             startupMs: 280,
             tapHoldMs: 55,
             tapGapMs: 55,
             postHoldMs: 90,
             sortOrder: 40,
+            requiredPotentials: platChantPot,
             VirtualDir.Left, VirtualDir.Right, VirtualDir.Left, VirtualDir.Right,
             VirtualDir.Left, VirtualDir.Right, VirtualDir.Left, VirtualDir.Right));
 
@@ -307,54 +505,114 @@ public static class CharacterCatalog
             id: "platinum.shining_layered_force",
             actorId: 101801,
             name: "Shining Layered Force (Spell Chant)",
-            hint: "Special (280ms) -> (U, L, D, R) x2",
+            hint: "SP (280ms) -> (U, L, D, R) x2",
             desc: "Performs authentic 280ms chant startup + 55ms directional taps.",
             startupMs: 280,
             tapHoldMs: 55,
             tapGapMs: 55,
             postHoldMs: 90,
             sortOrder: 50,
+            requiredPotentials: platChantPot,
             VirtualDir.Up, VirtualDir.Left, VirtualDir.Down, VirtualDir.Right,
             VirtualDir.Up, VirtualDir.Left, VirtualDir.Down, VirtualDir.Right));
+
+        list.Add(CreateChantSpell(
+            id: "platinum.chant_4dir",
+            actorId: 101801,
+            name: "Magical 4-Dir Spell (Chant)",
+            hint: "SP (280ms) -> U, D, L, R",
+            desc: "Chant spell: 4-direction miracle burst.",
+            startupMs: 280,
+            tapHoldMs: 55,
+            tapGapMs: 55,
+            postHoldMs: 90,
+            sortOrder: 55,
+            requiredPotentials: platChantPot,
+            VirtualDir.Up, VirtualDir.Down, VirtualDir.Left, VirtualDir.Right));
 
         list.Add(CreateChantSpell(
             id: "platinum.weapon_yellow",
             actorId: 101801,
             name: "Magical Weapon: Yellow (Chant)",
-            hint: "Special (280ms) -> Right x2",
+            hint: "SP (280ms) -> Right x2",
             desc: "280ms chant startup + Right, Right (55ms taps).",
             startupMs: 280,
             tapHoldMs: 55,
             tapGapMs: 55,
             postHoldMs: 90,
             sortOrder: 60,
+            requiredPotentials: platChantPot,
             VirtualDir.Right, VirtualDir.Right));
 
         list.Add(CreateChantSpell(
             id: "platinum.weapon_blue",
             actorId: 101801,
             name: "Magical Weapon: Blue (Chant)",
-            hint: "Special (280ms) -> Down x2",
+            hint: "SP (280ms) -> Down x2",
             desc: "280ms chant startup + Down, Down (55ms taps).",
             startupMs: 280,
             tapHoldMs: 55,
             tapGapMs: 55,
             postHoldMs: 90,
             sortOrder: 70,
+            requiredPotentials: platChantPot,
             VirtualDir.Down, VirtualDir.Down));
 
         list.Add(CreateChantSpell(
             id: "platinum.weapon_pink",
             actorId: 101801,
             name: "Magical Weapon: Pink (Chant)",
-            hint: "Special (280ms) -> Up x2",
+            hint: "SP (280ms) -> Up x2",
             desc: "280ms chant startup + Up, Up (55ms taps).",
             startupMs: 280,
             tapHoldMs: 55,
             tapGapMs: 55,
             postHoldMs: 90,
             sortOrder: 80,
+            requiredPotentials: platChantPot,
             VirtualDir.Up, VirtualDir.Up));
+
+        list.Add(CreateChantSpell(
+            id: "platinum.ex_weapon_yellow",
+            actorId: 101801,
+            name: "EX Weapon: Left x4 (Chant)",
+            hint: "SP (280ms) -> Left x4",
+            desc: "280ms chant startup + Left x4 EX weapon switch.",
+            startupMs: 280,
+            tapHoldMs: 55,
+            tapGapMs: 55,
+            postHoldMs: 90,
+            sortOrder: 85,
+            requiredPotentials: platChantPot,
+            VirtualDir.Left, VirtualDir.Left, VirtualDir.Left, VirtualDir.Left));
+
+        list.Add(CreateChantSpell(
+            id: "platinum.ex_weapon_blue",
+            actorId: 101801,
+            name: "EX Weapon: Down x4 (Chant)",
+            hint: "SP (280ms) -> Down x4",
+            desc: "280ms chant startup + Down x4 EX weapon switch.",
+            startupMs: 280,
+            tapHoldMs: 55,
+            tapGapMs: 55,
+            postHoldMs: 90,
+            sortOrder: 88,
+            requiredPotentials: platChantPot,
+            VirtualDir.Down, VirtualDir.Down, VirtualDir.Down, VirtualDir.Down));
+
+        list.Add(CreateChantSpell(
+            id: "platinum.ex_weapon_pink",
+            actorId: 101801,
+            name: "EX Weapon: Up x4 (Chant)",
+            hint: "SP (280ms) -> Up x4",
+            desc: "280ms chant startup + Up x4 EX weapon switch.",
+            startupMs: 280,
+            tapHoldMs: 55,
+            tapGapMs: 55,
+            postHoldMs: 90,
+            sortOrder: 90,
+            requiredPotentials: platChantPot,
+            VirtualDir.Up, VirtualDir.Up, VirtualDir.Up, VirtualDir.Up));
     }
 
     private static void AddLambdaPresets(List<MoveDefinition> list)
@@ -369,7 +627,9 @@ public static class CharacterCatalog
             ComboHint = "Hold -> Jump (25ms) -> 25ms -> Attack (30ms) -> 145ms",
             Description = "Continuous jump-cancel Crescent Strike loop (~225ms/cycle) while held.",
             Category = MoveCategory.HoldLoop,
+            IsBaseMove = true,
             HoldToRepeat = true,
+            RepeatCooldownMs = 0,
             IsPreset = true,
             SortOrder = 20,
             Steps = new()
@@ -393,6 +653,7 @@ public static class CharacterCatalog
             ComboHint = "Jump (25ms) -> 25ms -> Attack (30ms)",
             Description = "Performs one low jump-cancel Crescent Strike.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 30,
             Steps = new()
@@ -417,18 +678,19 @@ public static class CharacterCatalog
             Id = "noel.mark_detonation",
             ActorId = 100301,
             Name = "Mark Detonation",
-            ComboHint = "Up + Special",
-            Description = "Up (20ms) -> Special (40ms) -> 20ms.",
+            ComboHint = "Up + SP",
+            Description = "Up (20ms) -> SP (40ms) -> 20ms.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 20,
             Steps = new()
             {
                 InputStep.HoldDir(VirtualDir.Up),
                 InputStep.Wait(20),
-                InputStep.Press(InputActionKind.Special),
+                InputStep.Press(InputActionKind.Summon),
                 InputStep.Wait(40),
-                InputStep.Release(InputActionKind.Special),
+                InputStep.Release(InputActionKind.Summon),
                 InputStep.Wait(20),
                 InputStep.ReleaseDir()
             }
@@ -442,14 +704,15 @@ public static class CharacterCatalog
             Id = "icey.sheathe_dodge",
             ActorId = 103701,
             Name = "Sheathe Dodge Attack",
-            ComboHint = "Special + Down -> Skill",
-            Description = "Special + Down (15ms) -> Skill (15ms) -> 15ms.",
+            ComboHint = "SP + Down -> Skill",
+            Description = "SP + Down (15ms) -> Skill (15ms) -> 15ms.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 10,
             Steps = new()
             {
-                InputStep.Press(InputActionKind.Special),
+                InputStep.Press(InputActionKind.Summon),
                 InputStep.HoldDir(VirtualDir.Down),
                 InputStep.Wait(15),
                 InputStep.Press(InputActionKind.Skill),
@@ -457,7 +720,7 @@ public static class CharacterCatalog
                 InputStep.Release(InputActionKind.Skill),
                 InputStep.Wait(15),
                 InputStep.ReleaseDir(),
-                InputStep.Release(InputActionKind.Special)
+                InputStep.Release(InputActionKind.Summon)
             }
         });
 
@@ -466,18 +729,19 @@ public static class CharacterCatalog
             Id = "icey.sheathing_stance",
             ActorId = 103701,
             Name = "Sheathing Stance",
-            ComboHint = "Special + Down",
-            Description = "Special + Down (30ms).",
+            ComboHint = "SP + Down",
+            Description = "SP + Down (30ms).",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 20,
             Steps = new()
             {
-                InputStep.Press(InputActionKind.Special),
+                InputStep.Press(InputActionKind.Summon),
                 InputStep.HoldDir(VirtualDir.Down),
                 InputStep.Wait(30),
                 InputStep.ReleaseDir(),
-                InputStep.Release(InputActionKind.Special)
+                InputStep.Release(InputActionKind.Summon)
             }
         });
 
@@ -486,48 +750,33 @@ public static class CharacterCatalog
             Id = "icey.charging_stance",
             ActorId = 103701,
             Name = "Charging Stance",
-            ComboHint = "Special + Up",
-            Description = "Special + Up (30ms).",
+            ComboHint = "SP + Up",
+            Description = "SP + Up (30ms).",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = 30,
             Steps = new()
             {
-                InputStep.Press(InputActionKind.Special),
+                InputStep.Press(InputActionKind.Summon),
                 InputStep.HoldDir(VirtualDir.Up),
                 InputStep.Wait(30),
                 InputStep.ReleaseDir(),
-                InputStep.Release(InputActionKind.Special)
+                InputStep.Release(InputActionKind.Summon)
             }
         });
 
         list.Add(CreateDodgeAttack("icey.dodge_attack", 103701, 40));
     }
 
-    private static void AddTaokakaPresets(List<MoveDefinition> list)
+    private static void AddStandardCombos(List<MoveDefinition> list, int actorId, string prefix)
     {
-        list.Add(CreateDodgeAttack("taokaka.dodge_attack", 100501, 10, "Dash / Dodge Attack"));
-        AddStandardCombos(list, 100501, "taokaka", includeDodgeAttack: false);
-    }
-
-    private static void AddHibikiPresets(List<MoveDefinition> list)
-    {
-        list.Add(CreateDodgeAttack("hibiki.dodge_attack", 102901, 10, "Dash / Dodge Attack"));
-        AddStandardCombos(list, 102901, "hibiki", includeDodgeAttack: false);
-    }
-
-    private static void AddStandardCombos(List<MoveDefinition> list, int actorId, string prefix, bool includeDodgeAttack = true)
-    {
-        if (includeDodgeAttack)
-            list.Add(CreateDodgeAttack($"{prefix}.dodge_attack", actorId, 10, "Dash / Dodge Attack"));
-
+        list.Add(CreateDodgeAttack($"{prefix}.dodge_attack", actorId, 10, "Dash / Dodge Attack"));
         list.Add(CreateHeavyDodgeAttack($"{prefix}.heavy_dodge", actorId, 20, "Heavy Dodge Attack"));
         list.Add(CreateDirAction($"{prefix}.up_attack", actorId, "Up + Attack", VirtualDir.Up, InputActionKind.Attack, 30));
         list.Add(CreateDirAction($"{prefix}.down_attack", actorId, "Down + Attack", VirtualDir.Down, InputActionKind.Attack, 40));
         list.Add(CreateDirAction($"{prefix}.up_skill", actorId, "Up + Skill", VirtualDir.Up, InputActionKind.Skill, 50));
         list.Add(CreateDirAction($"{prefix}.down_skill", actorId, "Down + Skill", VirtualDir.Down, InputActionKind.Skill, 60));
-        list.Add(CreateDirAction($"{prefix}.up_special", actorId, "Up + Special", VirtualDir.Up, InputActionKind.Special, 70));
-        list.Add(CreateDirAction($"{prefix}.down_special", actorId, "Down + Special", VirtualDir.Down, InputActionKind.Special, 80));
     }
 
     private static MoveDefinition CreateDodgeAttack(string id, int actorId, int sortOrder, string name = "Dodge Attack")
@@ -540,6 +789,7 @@ public static class CharacterCatalog
             ComboHint = "Dash + Attack",
             Description = "Dash (40ms) -> Attack (40ms) -> 40ms.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = sortOrder,
             Steps = new()
@@ -565,6 +815,7 @@ public static class CharacterCatalog
             ComboHint = "Dash + Skill",
             Description = "Dash (40ms) -> Skill (40ms) -> 40ms.",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = sortOrder,
             Steps = new()
@@ -590,6 +841,7 @@ public static class CharacterCatalog
             ComboHint = $"{dir} + {act}",
             Description = $"Holds {dir} (40ms) and presses {act} (50ms).",
             Category = MoveCategory.CombatCombo,
+            IsBaseMove = true,
             IsPreset = true,
             SortOrder = sortOrder,
             Steps = new()
@@ -616,11 +868,12 @@ public static class CharacterCatalog
         int tapGapMs,
         int postHoldMs,
         int sortOrder,
+        uint[] requiredPotentials,
         params VirtualDir[] sequence)
     {
         var steps = new List<InputStep>
         {
-            InputStep.Press(InputActionKind.Special),
+            InputStep.Press(InputActionKind.Summon),
             InputStep.Wait(startupMs)
         };
 
@@ -635,7 +888,7 @@ public static class CharacterCatalog
 
         if (postHoldMs > 0)
             steps.Add(InputStep.Wait(postHoldMs));
-        steps.Add(InputStep.Release(InputActionKind.Special));
+        steps.Add(InputStep.Release(InputActionKind.Summon));
 
         return new MoveDefinition
         {
@@ -645,125 +898,240 @@ public static class CharacterCatalog
             ComboHint = hint,
             Description = desc,
             Category = MoveCategory.SpellChant,
+            IsBaseMove = requiredPotentials.Length == 0,
+            RequiredPotentialId = requiredPotentials.Length > 0 ? requiredPotentials[0] : 0u,
+            RequiredPotentialIds = requiredPotentials,
+            RepeatCooldownMs = 0,
             IsPreset = true,
             SortOrder = sortOrder,
             Steps = steps
         };
     }
 
-    private static List<InputStep>? ParseButtonSequence(string[] buttons, out string hint, out bool isMultiInput)
+    private static List<InputStep>? ParseLocalizedInput(
+        string inputRaw,
+        out string hint,
+        out bool isEligible,
+        out bool requiresAirborne,
+        out string canonicalKey)
     {
         hint = string.Empty;
-        isMultiInput = false;
-        if (buttons == null || buttons.Length == 0)
+        isEligible = false;
+        requiresAirborne = false;
+        canonicalKey = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(inputRaw))
             return null;
 
-        // Parse ActorActionConf button tokens like "Up+Attack", "Dash+Attack", "Down+Skill", "Jump+Attack", etc.
+        string s = inputRaw.Trim();
+        if (s.IndexOf("[Airborne]", StringComparison.OrdinalIgnoreCase) >= 0)
+            requiresAirborne = true;
+
+        // Normalize composite dynamic/combo wrappers
+        s = Regex.Replace(s, @"<combo>\s*<action=([^>]+)>\s*</combo>\s*<dynamic>\s*<action=[^>]+>\s*</dynamic>", "<action=$1>", RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, @"<action=Summon>\s*<action=Dynamic>", "<action=Summon>", RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, @"\[(?:Airborne|Ground)\]", "", RegexOptions.IgnoreCase);
+
+        // Take primary formula if "or" alternatives are listed
+        var branches = BranchSplitRegex.Split(s);
+        string branch = branches.Length > 0 ? branches[0].Trim() : s;
+
+        var rawParts = branch.Split(new[] { '·' }, StringSplitOptions.RemoveEmptyEntries);
         var steps = new List<InputStep>();
         var hintParts = new List<string>();
-        int distinctActions = 0;
-        bool hasDir = false;
+        var canonParts = new List<string>();
 
-        foreach (var raw in buttons)
+        bool hasDir = false;
+        bool hasHold = false;
+        bool hasRepeat = false;
+        bool usesNonBasic = false;
+        int totalActions = 0;
+
+        for (int pIdx = 0; pIdx < rawParts.Length; pIdx++)
         {
-            if (string.IsNullOrWhiteSpace(raw))
+            string part = rawParts[pIdx].Trim();
+            if (string.IsNullOrEmpty(part))
                 continue;
 
-            var parts = raw.Split(new[] { '+', ' ', '&' }, StringSplitOptions.RemoveEmptyEntries);
-            VirtualDir? stepDir = null;
-            var stepActs = new List<InputActionKind>();
+            bool partHold = part.IndexOf("hold", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool partRepeat = part.IndexOf("repeatedly", StringComparison.OrdinalIgnoreCase) >= 0
+                              || part.IndexOf("repeat", StringComparison.OrdinalIgnoreCase) >= 0;
 
-            foreach (var p in parts)
+            if (partHold) hasHold = true;
+            if (partRepeat) hasRepeat = true;
+
+            var dirs = new List<VirtualDir>();
+            var acts = new List<InputActionKind>();
+
+            foreach (Match m in ActionTagRegex.Matches(part))
             {
-                var token = p.Trim();
-                if (TryParseDir(token, out var d))
+                string tok = m.Groups[1].Value.Trim();
+                if (TryParseDirToken(tok, out var dir))
                 {
-                    stepDir = d;
+                    dirs.Add(dir);
                     hasDir = true;
                 }
-                else if (TryParseAction(token, out var a))
+                else if (TryParseActionToken(tok, out var act))
                 {
-                    stepActs.Add(a);
-                    distinctActions++;
+                    acts.Add(act);
+                    totalActions++;
+                    if (act is InputActionKind.Summon or InputActionKind.Special or InputActionKind.Special2
+                        or InputActionKind.Dynamic or InputActionKind.CustomUse1 or InputActionKind.CustomUse2 or InputActionKind.Ultra)
+                    {
+                        usesNonBasic = true;
+                    }
                 }
                 else
                 {
-                    // Unknown token (e.g. hold icon / passive marker) -> skip auto-synthesis safely
                     return null;
                 }
             }
 
-            if (stepDir == null && stepActs.Count == 0)
+            if (dirs.Count == 0 && acts.Count == 0)
                 continue;
 
-            var partDesc = new StringBuilder();
-            if (stepDir.HasValue)
+            // Special case: double directional tap like MoveX- + MoveX- or MoveY+ + MoveY+
+            if (acts.Count == 0 && dirs.Count >= 2)
             {
-                partDesc.Append(stepDir.Value);
-                steps.Add(InputStep.HoldDir(stepDir.Value));
-                steps.Add(InputStep.Wait(35));
+                var dirHint = new StringBuilder();
+                var dirCanon = new List<string>();
+                for (int d = 0; d < dirs.Count; d++)
+                {
+                    if (d > 0)
+                    {
+                        steps.Add(InputStep.Wait(55));
+                        dirHint.Append(" + ");
+                    }
+                    steps.Add(InputStep.HoldDir(dirs[d]));
+                    steps.Add(InputStep.Wait(45));
+                    steps.Add(InputStep.ReleaseDir());
+                    dirHint.Append(dirs[d]);
+                    dirCanon.Add(dirs[d].ToString());
+                }
+                hintParts.Add(dirHint.ToString());
+                canonParts.Add(string.Join("+", dirCanon));
+            }
+            else if (dirs.Count == 0 && acts.Count == 0)
+            {
+                continue;
+            }
+            else
+            {
+                VirtualDir? stepDir = dirs.Count > 0 ? dirs[0] : null;
+                int holdDurationMs = partHold ? 260 : 45;
+                int repeatCount = partRepeat ? 3 : 1;
+
+                var hSb = new StringBuilder();
+                if (partHold) hSb.Append("Hold ");
+                if (stepDir.HasValue)
+                {
+                    hSb.Append(stepDir.Value);
+                    steps.Add(InputStep.HoldDir(stepDir.Value));
+                    steps.Add(InputStep.Wait(25));
+                }
+
+                for (int rep = 0; rep < repeatCount; rep++)
+                {
+                    if (rep > 0)
+                        steps.Add(InputStep.Wait(50));
+
+                    for (int a = 0; a < acts.Count; a++)
+                    {
+                        if (rep == 0)
+                        {
+                            if (hSb.Length > 0 && (stepDir.HasValue || a > 0))
+                                hSb.Append(" + ");
+                            hSb.Append(FormatActionLabel(acts[a]));
+                        }
+                        steps.Add(InputStep.Press(acts[a]));
+                        if (a < acts.Count - 1)
+                            steps.Add(InputStep.Wait(30));
+                    }
+
+                    steps.Add(InputStep.Wait(holdDurationMs));
+
+                    for (int a = acts.Count - 1; a >= 0; a--)
+                        steps.Add(InputStep.Release(acts[a]));
+                }
+
+                if (stepDir.HasValue)
+                {
+                    steps.Add(InputStep.Wait(25));
+                    steps.Add(InputStep.ReleaseDir());
+                }
+
+                if (partRepeat)
+                    hSb.Append(" (x3)");
+
+                hintParts.Add(hSb.ToString());
+
+                var canonList = acts.Select(a => a.ToString()).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+                if (stepDir.HasValue)
+                    canonList.Insert(0, stepDir.Value.ToString());
+                if (partHold)
+                    canonList.Add("Hold");
+                if (partRepeat)
+                    canonList.Add("Repeat");
+                canonParts.Add(string.Join("+", canonList));
             }
 
-            for (int i = 0; i < stepActs.Count; i++)
-            {
-                if (partDesc.Length > 0)
-                    partDesc.Append(" + ");
-                partDesc.Append(stepActs[i]);
-                steps.Add(InputStep.Press(stepActs[i]));
-                if (i < stepActs.Count - 1)
-                    steps.Add(InputStep.Wait(35));
-            }
-
-            steps.Add(InputStep.Wait(45));
-
-            for (int i = stepActs.Count - 1; i >= 0; i--)
-                steps.Add(InputStep.Release(stepActs[i]));
-
-            if (stepDir.HasValue)
-            {
-                steps.Add(InputStep.Wait(20));
-                steps.Add(InputStep.ReleaseDir());
-            }
-
-            if (partDesc.Length > 0)
-                hintParts.Add(partDesc.ToString());
+            if (pIdx < rawParts.Length - 1)
+                steps.Add(InputStep.Wait(95));
         }
 
         if (steps.Count == 0)
             return null;
 
-        isMultiInput = hasDir || distinctActions >= 2 || hintParts.Count >= 2;
-        hint = string.Join(" -> ", hintParts);
+        // Avoid redundant pure 1-button ground taps (Attack, Skill, Dash, Jump already have native 1-button binds)
+        isEligible = requiresAirborne || hasDir || hasHold || hasRepeat || totalActions >= 2 || usesNonBasic;
+        string joinedHint = string.Join(" -> ", hintParts);
+        hint = requiresAirborne ? $"[Air] {joinedHint}" : joinedHint;
+
+        string canonBody = string.Join("->", canonParts);
+        canonicalKey = requiresAirborne ? $"air:{canonBody}" : canonBody;
         return steps;
     }
 
-    private static bool TryParseDir(string token, out VirtualDir dir)
+    private static string FormatActionLabel(InputActionKind act) => act switch
+    {
+        InputActionKind.Summon => "SP",
+        InputActionKind.Special => "Special",
+        InputActionKind.Special2 => "Special 2",
+        _ => act.ToString()
+    };
+
+    private static bool TryParseDirToken(string token, out VirtualDir dir)
     {
         switch (token.ToLowerInvariant())
         {
+            case "movey+":
             case "up":
             case "w":
                 dir = VirtualDir.Up;
                 return true;
+            case "movey-":
             case "down":
             case "s":
                 dir = VirtualDir.Down;
                 return true;
+            case "movex-":
             case "left":
             case "a":
                 dir = VirtualDir.Left;
                 return true;
+            case "movex+":
             case "right":
             case "d":
                 dir = VirtualDir.Right;
                 return true;
+            case "movex":
+            case "movex,movey":
             case "front":
             case "forward":
                 dir = VirtualDir.Forward;
                 return true;
-            case "back":
-            case "backward":
-                dir = VirtualDir.Back;
+            case "movey":
+                dir = VirtualDir.Up;
                 return true;
             default:
                 dir = VirtualDir.Neutral;
@@ -771,7 +1139,7 @@ public static class CharacterCatalog
         }
     }
 
-    private static bool TryParseAction(string token, out InputActionKind action)
+    private static bool TryParseActionToken(string token, out InputActionKind action)
     {
         switch (token.ToLowerInvariant())
         {
@@ -795,18 +1163,23 @@ public static class CharacterCatalog
             case "space":
                 action = InputActionKind.Jump;
                 return true;
-            case "special":
+            case "summon":
+                action = InputActionKind.Summon;
+                return true;
+            case "dynamic":
+                action = InputActionKind.Dynamic;
+                return true;
             case "specialaction1":
+            case "special":
             case "specialaction":
             case "legacy":
-            case "dynamic":
                 action = InputActionKind.Special;
+                return true;
+            case "specialaction2":
+                action = InputActionKind.Special2;
                 return true;
             case "ultra":
                 action = InputActionKind.Ultra;
-                return true;
-            case "summon":
-                action = InputActionKind.Summon;
                 return true;
             case "customuse1":
                 action = InputActionKind.CustomUse1;

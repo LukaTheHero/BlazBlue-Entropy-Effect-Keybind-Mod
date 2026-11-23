@@ -1,4 +1,4 @@
-/* BBEE Keybind Mod - Embedded PuerTS Bridge (read-only state, catalog & safe pause helper) */
+/* BBEE Keybind Mod - Embedded PuerTS Bridge (localized action catalog, active run unlocks & safe pause helper) */
 (function (root) {
     'use strict';
 
@@ -21,20 +21,20 @@
         const U = (safeRequire('Core/Util') || {}).U;
         const BattleJsMod = safeRequire('GamePlay/Battle/BattleJs');
         const BattleJs = BattleJsMod ? (BattleJsMod.default || BattleJsMod) : null;
-        const InputMgrMod = safeRequire('Manager/TsGameInputManager');
-        const InputMgr = InputMgrMod ? (InputMgrMod.default || InputMgrMod) : null;
-        const DBMod = safeRequire('DataBinding');
-        const DB = DBMod ? (DBMod.DB || DBMod.default) : null;
         const PrepareMod = safeRequire('GamePlay/BattleBreedPrepare/BattlePrepareUtil');
         const Prepare = PrepareMod ? (PrepareMod.default || PrepareMod) : null;
         const RunMod = safeRequire('GamePlay/BattleBreedRun/BattleBreedRun');
         const Run = RunMod ? (RunMod.default || RunMod) : null;
-
-        // Optional UI/Localization modules for resolving action/potential names
-        const LangMod = safeRequire('Language/LanguageManager')
-            || safeRequire('Manager/LanguageManager')
-            || safeRequire('Text/LanguageUtil')
-            || safeRequire('Core/Language');
+        const BreedRunBaseMod = safeRequire('GamePlay/BattleBreedRun/BattleBreedRunBase');
+        const BreedRunBase = BreedRunBaseMod ? (BreedRunBaseMod.default || BreedRunBaseMod) : null;
+        const InputMgrMod = safeRequire('Manager/TsGameInputManager');
+        const InputMgr = InputMgrMod ? (InputMgrMod.default || InputMgrMod) : null;
+        const DBMod = safeRequire('DataBinding');
+        const DB = DBMod ? (DBMod.DB || DBMod.default) : null;
+        const DataActorActionMod = safeRequire('Window/Potential/DataActorAction');
+        const DataActorActions = DataActorActionMod ? (DataActorActionMod.DataActorActions || DataActorActionMod.default) : null;
+        const DetailUtilMod = safeRequire('Window/CurrentActorDetail/CurrentActorDetailUtil');
+        const DetailUtil = DetailUtilMod ? (DetailUtilMod.CurrentActorDetailUtil || DetailUtilMod.default) : null;
 
         const pauseState = { added: false, owner: null, battle: null };
         let catalogSent = false;
@@ -69,100 +69,187 @@
             return out;
         }
 
-        function tryText(keyOrId) {
-            if (keyOrId === null || keyOrId === undefined || keyOrId === '' || keyOrId === 0) return '';
+        let cachedLocMgr = null;
+        function getLocMgr() {
+            if (cachedLocMgr) return cachedLocMgr;
+            try {
+                if (U && CS && CS.Localization && CS.Localization.LocalizationManager) {
+                    cachedLocMgr = U.GetSingleton(CS.Localization.LocalizationManager);
+                }
+            } catch (_) { }
+            return cachedLocMgr;
+        }
+
+        function tryLocaleStrict(key) {
+            if (key === null || key === undefined || key === '' || key === 0) return '';
+            const k = String(key);
+            try {
+                const mgr = getLocMgr();
+                if (mgr && typeof mgr.IsExist === 'function' && !mgr.IsExist(k)) {
+                    return '';
+                }
+            } catch (_) { }
             try {
                 if (U && typeof U.GetLocale === 'function') {
-                    const t = U.GetLocale(keyOrId);
-                    if (typeof t === 'string' && t && t !== String(keyOrId)) return t;
+                    const t = U.GetLocale(k);
+                    if (typeof t === 'string' && t && t !== k) return t;
                 }
             } catch (_) { }
             try {
                 if (U && typeof U.GetText === 'function') {
-                    const t = U.GetText(keyOrId);
-                    if (typeof t === 'string' && t && t !== String(keyOrId)) return t;
-                }
-            } catch (_) { }
-            try {
-                if (LangMod && typeof LangMod.GetText === 'function') {
-                    const t = LangMod.GetText(keyOrId);
-                    if (typeof t === 'string' && t && t !== String(keyOrId)) return t;
+                    const t = U.GetText(k);
+                    if (typeof t === 'string' && t && t !== k) return t;
                 }
             } catch (_) { }
             return '';
         }
 
-        function tryFindPotentialName(XTables, potentialId) {
-            if (!XTables || !potentialId) return '';
+        function cleanDesc(raw) {
+            if (!raw || typeof raw !== 'string') return '';
+            let s = raw;
+            s = s.replace(/<\/?(?:color|size|voffset|font|combo|dynamic)(?:=[^>]*)?>/gi, '');
+            s = s.replace(/<br\s*\/?>/gi, ' ');
+            s = s.replace(/<action=Summon>\s*<action=Dynamic>/gi, 'SP');
+            s = s.replace(/<action=MoveY\+>/gi, 'Up');
+            s = s.replace(/<action=MoveY->/gi, 'Down');
+            s = s.replace(/<action=MoveX\+>/gi, 'Right');
+            s = s.replace(/<action=MoveX->/gi, 'Left');
+            s = s.replace(/<action=MoveX>/gi, 'Forward');
+            s = s.replace(/<action=MoveY>/gi, 'Up/Down');
+            s = s.replace(/<action=MoveX,MoveY>/gi, 'Dir');
+            s = s.replace(/<action=Summon>/gi, 'SP');
+            s = s.replace(/<action=SpecialAction1>/gi, 'Special');
+            s = s.replace(/<action=SpecialAction2>/gi, 'Special 2');
+            s = s.replace(/<action=Dynamic>/gi, 'SP');
+            s = s.replace(/<action=([^>]+)>/gi, '$1');
+            s = s.replace(/\s+/g, ' ').trim();
+            return s;
+        }
+
+        function buildPotentialMaps() {
+            const potentialsByAction = new Map();
+            const comboSetsByAction = new Map();
+            const potNameById = new Map();
+
             try {
-                const pot = XTables.BaseActorPotentialConf ? XTables.BaseActorPotentialConf.Get(potentialId) : null;
-                if (pot && pot.triggerInfo && pot.triggerInfo.id) {
-                    const td = XTables.PlayerBattleTriggerDetail
-                        ? XTables.PlayerBattleTriggerDetail.Get(pot.triggerInfo.id, pot.triggerInfo.level || 1)
-                        : null;
-                    if (td && typeof td.name === 'string' && td.name) {
-                        const loc = tryText(td.name);
-                        return loc || td.name;
-                    }
-                    // Also check BattleTriggerDesc or PotentialDesc keys if present
-                    for (const prefix of ['PotentialName_', 'SkillName_', 'TriggerName_']) {
-                        const loc = tryText(prefix + potentialId) || tryText(prefix + pot.triggerInfo.id);
-                        if (loc) return loc;
+                const allPots = readList(X && X.BaseActorPotentialConf && X.BaseActorPotentialConf.All);
+                for (const p of allPots) {
+                    if (!p) continue;
+                    const pid = Number(p.id) >>> 0;
+                    if (!pid) continue;
+
+                    let pName = '';
+                    try {
+                        const tid = p.triggerInfo ? Number(p.triggerInfo.id) || 0 : 0;
+                        if (tid) {
+                            pName = tryLocaleStrict('TriggerName_' + tid);
+                            if (!pName && X.PlayerBattleTriggerDetail) {
+                                const td = X.PlayerBattleTriggerDetail.Get(tid, p.triggerInfo.level || 1);
+                                if (td && typeof td.name === 'string' && td.name) {
+                                    pName = tryLocaleStrict(td.name) || td.name;
+                                }
+                            }
+                        }
+                    } catch (_) { }
+                    if (pName) potNameById.set(pid, cleanDesc(pName));
+
+                    const rels = readList(p.relationId).map(n => Number(n) >>> 0);
+                    for (const aid of rels) {
+                        if (!aid) continue;
+                        if (!potentialsByAction.has(aid)) potentialsByAction.set(aid, []);
+                        const arr = potentialsByAction.get(aid);
+                        if (!arr.includes(pid)) arr.push(pid);
                     }
                 }
             } catch (_) { }
-            return '';
+
+            try {
+                const allCombos = readList(X && X.PotentialComboConf && X.PotentialComboConf.All);
+                for (const c of allCombos) {
+                    if (!c) continue;
+                    const reqPots = readList(c.potentials).map(n => Number(n) >>> 0).filter(n => n > 0);
+                    const rels = readList(c.relationId).map(n => Number(n) >>> 0);
+                    if (!reqPots.length) continue;
+                    for (const aid of rels) {
+                        if (!aid) continue;
+                        if (!comboSetsByAction.has(aid)) comboSetsByAction.set(aid, []);
+                        comboSetsByAction.get(aid).push(reqPots);
+                    }
+                }
+            } catch (_) { }
+
+            return { potentialsByAction, comboSetsByAction, potNameById };
         }
 
         function sendCatalog(force) {
             if (catalogSent && !force) return;
             const actions = [];
             const instructions = [];
-            const xTextTables = [];
 
             try {
                 if (X) {
-                    try {
-                        for (const k of Object.keys(X)) {
-                            if (/text|name|desc|lang|action|potential|skill/i.test(k)) {
-                                xTextTables.push(k);
-                            }
-                        }
-                    } catch (_) { }
-
+                    const { potentialsByAction, comboSetsByAction, potNameById } = buildPotentialMaps();
                     const allActions = readList(X.ActorActionConf && X.ActorActionConf.All);
+                    const actionNameById = new Map();
+
                     for (const row of allActions) {
-                        if (!row || row.close) continue;
-                        const buttons = readList(row.buttons).map(b => String(b));
-                        if (!buttons.length) continue;
+                        if (!row || row.close || Number(row.type) !== 1) continue;
+                        const id = Number(row.id) >>> 0;
+                        if (!id) continue;
+                        const nm = cleanDesc(tryLocaleStrict('ActorActionName_' + id));
+                        if (nm) actionNameById.set(id, nm);
+                    }
 
-                        const labels = readList(row.label).map(l => String(l));
-                        const replaceIds = readList(row.replace).map(n => Number(n) >>> 0);
-                        const fromPot = Number(row.fromPotential) || 0;
-                        const fromCombo = Number(row.fromPotentialCombo) || 0;
+                    for (const row of allActions) {
+                        if (!row || row.close || Number(row.type) !== 1) continue;
+                        const id = Number(row.id) >>> 0;
+                        if (!id) continue;
 
-                        let name = '';
-                        if (fromPot > 0) name = tryFindPotentialName(X, fromPot);
-                        if (!name && labels.length > 0) {
-                            for (const lb of labels) {
-                                const t = tryText(lb);
-                                if (t) { name = t; break; }
+                        const inputRaw = tryLocaleStrict('ActorActionInput_' + id);
+                        if (!inputRaw) continue;
+
+                        const inheritIds = readList(row.inherit).map(n => Number(n) >>> 0).filter(n => n > 0);
+                        const replaceIds = readList(row.replace).map(n => Number(n) >>> 0).filter(n => n > 0);
+                        const labels = readList(row.label).map(l => cleanDesc(tryLocaleStrict(String(l)) || String(l))).filter(Boolean);
+                        const potIds = potentialsByAction.get(id) || [];
+                        const comboSets = comboSetsByAction.get(id) || [];
+                        const isBase = potIds.length === 0 && comboSets.length === 0;
+
+                        let name = actionNameById.get(id) || '';
+                        if (!name && inheritIds.length > 0) {
+                            for (const inh of inheritIds) {
+                                if (actionNameById.has(inh)) {
+                                    name = actionNameById.get(inh);
+                                    break;
+                                }
                             }
                         }
+                        if (!name && potIds.length > 0) {
+                            for (const pid of potIds) {
+                                if (potNameById.has(pid)) {
+                                    name = potNameById.get(pid);
+                                    break;
+                                }
+                            }
+                        }
+
+                        const desc = cleanDesc(tryLocaleStrict('ActorActionDesc_' + id));
 
                         actions.push({
-                            id: Number(row.id) >>> 0,
+                            id: id,
                             actorId: Number(row.actorId) || 0,
-                            type: Number(row.type) || 0,
-                            buttons: buttons,
-                            fromPotential: fromPot >>> 0,
-                            fromPotentialCombo: fromCombo >>> 0,
+                            type: 1,
+                            name: name,
+                            inputRaw: inputRaw,
+                            desc: desc,
+                            isBase: isBase,
+                            potentialIds: potIds,
+                            comboPotentialSets: comboSets,
                             replace: replaceIds,
+                            inherit: inheritIds,
                             isUltra: Boolean(row.isUltraSkill),
-                            showInBattle: Boolean(row.showInBattle),
                             sortOrder: Number(row.sortOrder) || 0,
-                            labels: labels,
-                            name: name
+                            labels: labels
                         });
                     }
 
@@ -186,9 +273,95 @@
             emit({
                 kind: 'catalog',
                 actions: actions,
-                instructions: instructions,
-                xKeys: xTextTables.slice(0, 40)
+                instructions: instructions
             });
+        }
+
+        function resolveFesActor(js) {
+            let fesActor = null;
+            try { fesActor = js && typeof js.GetFesActor === 'function' ? js.GetFesActor() : null; } catch (_) { }
+            if (!fesActor) {
+                try {
+                    if (DetailUtil && js && js.BattleType) {
+                        fesActor = DetailUtil.GetActor(js.BattleType);
+                    }
+                } catch (_) { }
+            }
+            if (!fesActor) {
+                try {
+                    const brb = BreedRunBase && BreedRunBase.SilentInstance;
+                    if (brb && brb.dungeon && brb.dungeon.actorInfo) {
+                        fesActor = brb.dungeon.actorInfo.fesActor;
+                    }
+                } catch (_) { }
+            }
+            if (!fesActor) {
+                try {
+                    fesActor = Run && Run.SilentInstance && Run.SilentInstance.PlayerNetSt && Run.SilentInstance.PlayerNetSt.MyStatus
+                        ? Run.SilentInstance.PlayerNetSt.MyStatus.FesActor
+                        : null;
+                } catch (_) { }
+            }
+            return fesActor;
+        }
+
+        function computeObtainedActionIds(fesActor, ownedPotSet) {
+            const obtained = [];
+            if (!fesActor || !fesActor.id) return obtained;
+
+            try {
+                if (DataActorActions && typeof DataActorActions.GetActionData === 'function') {
+                    const res = DataActorActions.GetActionData(fesActor);
+                    if (res && res[0]) {
+                        for (const aid of res[0]) {
+                            const num = Number(aid) >>> 0;
+                            if (num > 0) obtained.push(num);
+                        }
+                        if (obtained.length > 0) return obtained;
+                    }
+                }
+            } catch (_) { }
+
+            try {
+                if (!X || !X.ActorActionConf) return obtained;
+                const actorId = Number(fesActor.id) || 0;
+                const potRel = new Set();
+                const comboRel = new Set();
+
+                for (const p of readList(X.BaseActorPotentialConf && X.BaseActorPotentialConf.All)) {
+                    if (!p || Number(p.actorId) !== actorId) continue;
+                    for (const rid of readList(p.relationId)) potRel.add(Number(rid) >>> 0);
+                }
+                const actorCombos = [];
+                for (const c of readList(X.PotentialComboConf && X.PotentialComboConf.All)) {
+                    if (!c || Number(c.actorId) !== actorId) continue;
+                    actorCombos.push(c);
+                    for (const rid of readList(c.relationId)) comboRel.add(Number(rid) >>> 0);
+                }
+
+                const set = new Set();
+                for (const act of readList(X.ActorActionConf.All)) {
+                    if (!act || act.close || Number(act.actorId) !== actorId) continue;
+                    const id = Number(act.id) >>> 0;
+                    if (!potRel.has(id) && !comboRel.has(id)) set.add(id);
+                }
+                for (const pid of ownedPotSet) {
+                    const pConf = X.BaseActorPotentialConf ? X.BaseActorPotentialConf.Get(pid) : null;
+                    if (!pConf) continue;
+                    for (const rid of readList(pConf.relationId)) set.add(Number(rid) >>> 0);
+                }
+                for (const c of actorCombos) {
+                    const req = readList(c.potentials).map(n => Number(n) >>> 0);
+                    if (req.length > 0 && req.every(pid => ownedPotSet.has(pid))) {
+                        for (const rid of readList(c.relationId)) set.add(Number(rid) >>> 0);
+                    }
+                }
+                for (const aid of set) {
+                    if (aid > 0) obtained.push(aid);
+                }
+            } catch (_) { }
+
+            return obtained;
         }
 
         function getSnapshot(includeCatalog) {
@@ -197,9 +370,11 @@
             }
 
             let activeActorId = 0;
+            let fesActorId = 0;
             let inBattle = false;
             let inputLocked = false;
             const potentials = [];
+            let obtainedActionIds = [];
             const unlockedFighters = [];
 
             try {
@@ -233,18 +408,21 @@
                         inputLocked = flag !== 0 || !interactable || paused;
                     } catch (_) { }
 
-                    let fesActor = null;
-                    try { fesActor = typeof js.GetFesActor === 'function' ? js.GetFesActor() : null; } catch (_) { }
-                    if (!fesActor) {
-                        try { fesActor = Run && Run.SilentInstance && Run.SilentInstance.PlayerNetSt && Run.SilentInstance.PlayerNetSt.MyStatus ? Run.SilentInstance.PlayerNetSt.MyStatus.FesActor : null; } catch (_) { }
-                    }
-
-                    if (fesActor && fesActor.potentials) {
-                        const pots = readList(fesActor.potentials);
-                        for (const p of pots) {
-                            const pid = Number(p && (p.id !== undefined ? p.id : p.Id)) >>> 0;
-                            if (pid > 0) potentials.push(pid);
+                    const fesActor = resolveFesActor(js);
+                    if (fesActor) {
+                        fesActorId = Number(fesActor.id) || 0;
+                        const ownedPotSet = new Set();
+                        if (fesActor.potentials) {
+                            const pots = readList(fesActor.potentials);
+                            for (const p of pots) {
+                                const pid = Number(p && (p.id !== undefined ? p.id : p.Id)) >>> 0;
+                                if (pid > 0) {
+                                    potentials.push(pid);
+                                    ownedPotSet.add(pid);
+                                }
+                            }
                         }
+                        obtainedActionIds = computeObtainedActionIds(fesActor, ownedPotSet);
                     }
                 }
             } catch (ex) {
@@ -254,9 +432,11 @@
             emit({
                 kind: 'state',
                 activeActorId: activeActorId,
+                fesActorId: fesActorId,
                 inBattle: inBattle,
                 inputLocked: inputLocked,
                 potentials: potentials,
+                obtainedActionIds: obtainedActionIds,
                 unlockedFighters: unlockedFighters
             });
         }

@@ -3,7 +3,6 @@ using GamePlay;
 using HarmonyLib;
 using Il2CppSystem.Collections.Generic;
 using Rewired;
-using Unity.Mathematics.FixedPoint;
 using UnityEngine;
 
 namespace Luka.BBEE.KeybindMod;
@@ -14,37 +13,44 @@ public static class InputHooks
     private static InputCmd? _rewiredSpecialCmd;
     private static bool _rewiredChecked;
 
-    [HarmonyPatch(typeof(GameInputManager), nameof(GameInputManager.NotifyDirChange))]
-    private static class NotifyDirChangePatch
+    [HarmonyPatch(typeof(GameInputManager), nameof(GameInputManager.ResolveActorAxis))]
+    private static class ResolveActorAxisPatch
     {
-        private static bool Prefix(int playerId, InputCmd cmd, Fp2 dir)
+        private static bool Prefix(GameInputManager __instance, int playerId, Vector2 dir, bool ignoreLock)
         {
             if (InputSequencer.IsInjecting)
                 return true;
 
-            if (cmd == InputCmd.Move && playerId == InputSequencer.ActivePlayerId)
+            if (playerId == InputSequencer.ActivePlayerId)
             {
-                InputSequencer.LastPhysicalDir = dir;
+                InputSequencer.LastPhysicalVec = dir;
                 if (InputSequencer.HasVirtualDirLock)
-                    return false;
+                {
+                    var merged = InputSequencer.ApplyVirtualDir(dir);
+                    if ((merged - dir).sqrMagnitude > 0.0001f)
+                    {
+                        InputSequencer.SendAxisDirect(__instance, playerId, merged, ignoreLock);
+                        return false;
+                    }
+                }
             }
 
             return true;
         }
     }
 
-    [HarmonyPatch(typeof(GameInputManager), nameof(GameInputManager.NotifyCmdChange))]
-    private static class NotifyCmdChangePatch
+    [HarmonyPatch(typeof(GameInputManager), nameof(GameInputManager.ResolveActorButton))]
+    private static class ResolveActorButtonPatch
     {
-        private static void Postfix(int playerId, InputCmd cmd, bool pressed, Fp2 dir)
+        private static void Postfix(int playerId, InputCmd cmd, bool pressed, Vector2 dir, bool ignoreLock)
         {
             if (InputSequencer.IsInjecting || !pressed || playerId != InputSequencer.ActivePlayerId)
                 return;
 
-            // Observe which InputCmd corresponds to LeftCtrl/RightCtrl if player uses Chant/Special manually
+            // Observe which InputCmd corresponds to LeftCtrl/RightCtrl if player triggers Chant/Special manually
             if ((UnityEngine.Input.GetKey(KeyCode.LeftControl) || UnityEngine.Input.GetKey(KeyCode.RightControl)) &&
-                (cmd == InputCmd.SpecialAction1 || cmd == InputCmd.SpecialAction2 || cmd == InputCmd.SpecialAction3 ||
-                 cmd == InputCmd.SpecialAction4 || cmd == InputCmd.Dynamic))
+                (cmd == InputCmd.Summon || cmd == InputCmd.SpecialAction1 || cmd == InputCmd.SpecialAction2 ||
+                 cmd == InputCmd.SpecialAction3 || cmd == InputCmd.SpecialAction4 || cmd == InputCmd.Dynamic))
             {
                 if (ObservedSpecialCmd != cmd)
                 {
@@ -63,8 +69,10 @@ public static class InputHooks
             case InputActionKind.Skill: return InputCmd.Skill;
             case InputActionKind.Dash: return InputCmd.Dash;
             case InputActionKind.Jump: return InputCmd.Jump;
-            case InputActionKind.Ultra: return InputCmd.Ultra;
             case InputActionKind.Summon: return InputCmd.Summon;
+            case InputActionKind.Dynamic: return InputCmd.Dynamic;
+            case InputActionKind.Special2: return InputCmd.SpecialAction2;
+            case InputActionKind.Ultra: return InputCmd.Ultra;
             case InputActionKind.CustomUse1: return InputCmd.CustomUse1;
             case InputActionKind.CustomUse2: return InputCmd.CustomUse2;
             case InputActionKind.Special:
@@ -101,6 +109,7 @@ public static class InputHooks
 
             (int actionId, InputCmd cmd)[] candidates =
             {
+                (RewiredConsts.Action.Summon, InputCmd.Summon),
                 (RewiredConsts.Action.SpecialAction1, InputCmd.SpecialAction1),
                 (RewiredConsts.Action.SpecialAction2, InputCmd.SpecialAction2),
                 (RewiredConsts.Action.SpecialAction4, InputCmd.SpecialAction4),

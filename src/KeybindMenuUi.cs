@@ -22,6 +22,7 @@ public sealed class KeybindMenuUi
     private static readonly Color TextCol = new(0.93f, 0.96f, 0.99f, 1f);
     private static readonly Color BadgeIdleCol = new(0.13f, 0.18f, 0.26f, 1f);
     private static readonly Color BadgeBoundCol = new(0.12f, 0.36f, 0.44f, 1f);
+    private static readonly Color HoldOnBgCol = new(0.10f, 0.32f, 0.24f, 1f);
 
     private GUIStyle? _solidStyle;
     private GUIStyle? _kickerStyle;
@@ -31,7 +32,6 @@ public sealed class KeybindMenuUi
     private GUIStyle? _cardSubStyle;
     private GUIStyle? _badgeStyle;
     private GUIStyle? _btnStyle;
-    private GUIStyle? _clearStyle;
 
     private Vector2 _scrollPos = Vector2.zero;
 
@@ -39,6 +39,8 @@ public sealed class KeybindMenuUi
     public bool ShowLockedMoves { get; set; }
     public string? ListeningMoveId { get; private set; }
     public bool WaitingMouseReleaseBeforeListen { get; set; }
+    public bool ClicksLocked { get; set; }
+    public float SuppressClicksUntil { get; set; }
 
     public void BeginListening(string moveId)
     {
@@ -103,7 +105,7 @@ public sealed class KeybindMenuUi
 
             string liveLabel = snapshot.InBattle
                 ? $"ACTIVE IN RUN: {CharacterCatalog.GetCharacterName(snapshot.ActiveActorId).ToUpperInvariant()}"
-                : "OUT OF BATTLE (SELECT ANY FIGHTER TO EDIT)";
+                : "OUT OF BATTLE (SHOWING BASE MOVES WHEN FILTERED)";
             var liveColor = snapshot.InBattle ? CyanCol : MutedCol;
             _subStyle!.normal.textColor = liveColor;
             _subStyle.alignment = TextAnchor.MiddleRight;
@@ -140,7 +142,7 @@ public sealed class KeybindMenuUi
                 var border = isSelectedTab ? CyanCol : (isLiveFighter ? GreenCol : CardBorderCol);
                 float bw = (isSelectedTab || isLiveFighter) ? 2f : 1f;
 
-                if (r.Contains(Event.current.mousePosition) && !isSelectedTab)
+                if (r.Contains(Event.current.mousePosition) && !isSelectedTab && ListeningMoveId == null)
                     bg = CardHoverCol;
 
                 DrawBox(r, bg, border, bw);
@@ -153,7 +155,9 @@ public sealed class KeybindMenuUi
                 _btnStyle!.normal.textColor = isSelectedTab ? CyanCol : (isLiveFighter ? GreenCol : TextCol);
                 _btnStyle.fontSize = 13;
                 _btnStyle.fontStyle = isSelectedTab ? FontStyle.Bold : FontStyle.Normal;
-                if (GUI.Button(r, caption, _btnStyle))
+                GUI.Label(r, caption, _btnStyle);
+
+                if (IsControlLeftClickIn(r))
                 {
                     CancelListening();
                     SelectedCharacterId = fighter.ActorId;
@@ -167,19 +171,34 @@ public sealed class KeybindMenuUi
             // Filter & Utility Bar
             var allMoves = CharacterCatalog.GetMoves(SelectedCharacterId);
             var visibleMoves = new List<MoveDefinition>();
+            int unlockedCount = 0;
             for (int i = 0; i < allMoves.Count; i++)
             {
                 var m = allMoves[i];
-                if (ShowLockedMoves || !snapshot.InBattle || m.IsUnlockedInRun(snapshot))
+                bool unlocked = m.IsUnlockedInRun(snapshot);
+                if (unlocked)
+                    unlockedCount++;
+                if (ShowLockedMoves || unlocked)
                     visibleMoves.Add(m);
             }
 
-            if (DrawStyledButton(new Rect(px + pad, toolbarY, 150f, 30f), $"Unlocked Only", !ShowLockedMoves, false))
+            if (DrawStyledButton(new Rect(px + pad, toolbarY, 162f, 30f), $"Unlocked Only ({unlockedCount})", !ShowLockedMoves, false))
+            {
+                CancelListening();
                 ShowLockedMoves = false;
-            if (DrawStyledButton(new Rect(px + pad + 158f, toolbarY, 140f, 30f), $"All Moves ({allMoves.Count})", ShowLockedMoves, false))
+                _scrollPos = Vector2.zero;
+            }
+            if (DrawStyledButton(new Rect(px + pad + 170f, toolbarY, 152f, 30f), $"All Moves ({allMoves.Count})", ShowLockedMoves, false))
+            {
+                CancelListening();
                 ShowLockedMoves = true;
-            if (DrawStyledButton(new Rect(px + pad + 308f, toolbarY, 160f, 30f), $"HUD Pill: {(showHud ? "ON" : "OFF")}", showHud, false))
+                _scrollPos = Vector2.zero;
+            }
+            if (DrawStyledButton(new Rect(px + pad + 330f, toolbarY, 156f, 30f), $"HUD Pill: {(showHud ? "ON" : "OFF")}", showHud, false))
+            {
+                CancelListening();
                 onToggleHud(!showHud);
+            }
 
             if (DrawStyledButton(new Rect(px + panelW - pad - 170f, toolbarY, 170f, 30f), "Clear Fighter Binds", false, true))
             {
@@ -196,9 +215,9 @@ public sealed class KeybindMenuUi
             int skillCols = 2;
             float sGap = 12f;
             float cardW = (contentW - 22f - sGap) / skillCols;
-            float cardH = 74f;
+            float cardH = 76f;
             int sRows = Math.Max(1, (visibleMoves.Count + skillCols - 1) / skillCols);
-            float innerH = Math.Max(listH - 4f, sRows * (cardH + sGap));
+            float innerH = Math.Max(listH - 4f, sRows * (cardH + sGap) + 6f);
             var innerRect = new Rect(0f, 0f, contentW - 20f, innerH);
 
             DrawBox(viewPort, new Color(0.04f, 0.06f, 0.10f, 0.7f), CardBorderCol, 1f);
@@ -208,7 +227,7 @@ public sealed class KeybindMenuUi
             {
                 _subStyle.normal.textColor = MutedCol;
                 _subStyle.alignment = TextAnchor.MiddleCenter;
-                GUI.Label(new Rect(0, 40f, innerRect.width, 40f), "No unlocked moves detected yet — toggle 'All Moves' to inspect & bind presets.", _subStyle);
+                GUI.Label(new Rect(0f, 40f, innerRect.width, 40f), "No unlocked moves detected yet — click 'All Moves' to inspect & bind skills.", _subStyle);
             }
             else
             {
@@ -231,7 +250,7 @@ public sealed class KeybindMenuUi
             _subStyle.alignment = TextAnchor.MiddleLeft;
             string footText = ListeningMoveId != null
                 ? "LISTENING: Press any Keyboard key or Mouse button (including Mouse 4 / Mouse 5) to bind  |  Esc: Unassign"
-                : $"Click skill card to bind (Keyboard / Mouse 1-7)  |  Esc: Unassign (when binding) / Close  |  {KeyCodeFormatter.Format(menuKey)}: Toggle Menu";
+                : $"LMB Card: Bind key  |  LMB [HOLD]: Repeat while held  |  Esc: Unassign / Close  |  {KeyCodeFormatter.Format(menuKey)}: Toggle";
             if (ListeningMoveId != null)
                 _subStyle.normal.textColor = AmberCol;
 
@@ -290,6 +309,36 @@ public sealed class KeybindMenuUi
         }
     }
 
+    private bool CanAcceptClick() => !ClicksLocked && Time.realtimeSinceStartup >= SuppressClicksUntil;
+
+    private bool IsLeftClickIn(Rect rect)
+    {
+        if (!CanAcceptClick() || ListeningMoveId != null)
+            return false;
+
+        var ev = Event.current;
+        if (ev != null && ev.type == EventType.MouseDown && ev.button == 0 && rect.Contains(ev.mousePosition))
+        {
+            ev.Use();
+            return true;
+        }
+        return false;
+    }
+
+    private bool IsControlLeftClickIn(Rect rect)
+    {
+        if (!CanAcceptClick())
+            return false;
+
+        var ev = Event.current;
+        if (ev != null && ev.type == EventType.MouseDown && ev.button == 0 && rect.Contains(ev.mousePosition))
+        {
+            ev.Use();
+            return true;
+        }
+        return false;
+    }
+
     private static void ConsumePointerEvent()
     {
         var ev = Event.current;
@@ -307,28 +356,35 @@ public sealed class KeybindMenuUi
         bool isListening = ListeningMoveId == move.Id;
         var boundKey = store.GetBinding(move.Id);
         bool isBound = boundKey != KeyCode.None;
-        bool isUnlocked = !snapshot.InBattle || move.IsUnlockedInRun(snapshot);
+        bool isUnlocked = move.IsUnlockedInRun(snapshot);
+        bool showHoldToggle = move.Category != MoveCategory.SpellChant;
+        bool holdOn = showHoldToggle && store.GetHoldRepeat(move);
         bool hasDup = isBound && store.GetDuplicateMoves(allCharacterMoves, move.Id, boundKey).Count > 0;
 
+        float badgeW = 128f;
+        var badgeRect = new Rect(rect.x + rect.width - badgeW - 10f, rect.y + 16f, badgeW, 44f);
+        float holdW = 64f;
+        var holdRect = new Rect(badgeRect.x - holdW - 8f, rect.y + 24f, holdW, 28f);
+
+        bool hoveringHold = showHoldToggle && holdRect.Contains(Event.current.mousePosition);
         var bg = isListening ? CardListeningCol : (isBound ? CardSelectedCol : CardCol);
-        if (rect.Contains(Event.current.mousePosition) && !isListening)
+        if (rect.Contains(Event.current.mousePosition) && !isListening && !hoveringHold && ListeningMoveId == null)
             bg = CardHoverCol;
 
         var border = isListening ? AmberCol : (hasDup ? AmberCol : (isBound ? CyanCol : CardBorderCol));
         DrawBox(rect, bg, border, (isListening || isBound) ? 1.5f : 1f);
 
-        // Text on left side
-        float badgeW = 136f;
-        float textW = rect.width - badgeW - 22f;
+        float textW = (showHoldToggle ? holdRect.x : badgeRect.x) - rect.x - 18f;
 
         _cardTitleStyle!.normal.textColor = isUnlocked ? TextCol : MutedCol;
         GUI.Label(new Rect(rect.x + 12f, rect.y + 8f, textW, 22f), move.Name, _cardTitleStyle);
 
         string tag = move.Category switch
         {
-            MoveCategory.SpellChant => "SPELL CHANT",
-            MoveCategory.HoldLoop => "HOLD LOOP",
-            _ => isUnlocked ? "READY" : "LOCKED"
+            MoveCategory.SpellChant => isUnlocked ? "SPELL CHANT" : "LOCKED CHANT",
+            _ => !isUnlocked
+                ? ((move.RequiredPotentialIds.Length > 0 || move.RequiredPotentialId != 0) ? "POTENTIAL" : "LOCKED")
+                : (holdOn ? "READY + HOLD" : (move.IsBaseMove ? "BASE" : "UNLOCKED"))
         };
         string sub = $"[{tag}]  {move.ComboHint}";
         _cardSubStyle!.normal.textColor = isUnlocked ? MutedCol : new Color(0.45f, 0.50f, 0.56f, 1f);
@@ -337,8 +393,26 @@ public sealed class KeybindMenuUi
         _cardSubStyle.normal.textColor = new Color(0.50f, 0.60f, 0.70f, 1f);
         GUI.Label(new Rect(rect.x + 12f, rect.y + 49f, textW, 18f), move.Description, _cardSubStyle);
 
+        // Optional small Hold-to-Spam toggle box next to non-SpellChant skills
+        if (showHoldToggle)
+        {
+            var holdBg = holdOn ? HoldOnBgCol : (hoveringHold && ListeningMoveId == null ? CardHoverCol : BadgeIdleCol);
+            var holdBorder = holdOn ? GreenCol : (hoveringHold && ListeningMoveId == null ? CyanCol : CardBorderCol);
+            DrawBox(holdRect, holdBg, holdBorder, holdOn ? 1.5f : 1f);
+
+            _btnStyle!.normal.textColor = holdOn ? GreenCol : MutedCol;
+            _btnStyle.fontSize = 10;
+            _btnStyle.fontStyle = holdOn ? FontStyle.Bold : FontStyle.Normal;
+            GUI.Label(holdRect, holdOn ? "[x] HOLD" : "[ ] HOLD", _btnStyle);
+
+            if (IsLeftClickIn(holdRect))
+            {
+                store.SetHoldRepeat(move.Id, !holdOn);
+                return;
+            }
+        }
+
         // Right-aligned Keybind badge
-        var badgeRect = new Rect(rect.x + rect.width - badgeW - 10f, rect.y + 15f, badgeW, 44f);
         var badgeBg = isListening ? new Color(0.42f, 0.28f, 0.04f, 1f) : (isBound ? BadgeBoundCol : BadgeIdleCol);
         var badgeBorder = isListening ? AmberCol : (hasDup ? AmberCol : (isBound ? CyanCol : CardBorderCol));
         DrawBox(badgeRect, badgeBg, badgeBorder, 1f);
@@ -351,20 +425,15 @@ public sealed class KeybindMenuUi
         _badgeStyle.fontSize = isListening ? 11 : 13;
         GUI.Label(badgeRect, badgeText, _badgeStyle);
 
-        // Transparent invisible button covering entire card for snappy click UX
-        if (GUI.Button(rect, string.Empty, _clearStyle!))
-        {
-            if (isListening)
-                CancelListening();
-            else
-                BeginListening(move.Id);
-        }
+        // Left-click only on card enters listening state (Mouse4/5 releases NEVER re-trigger this)
+        if (IsLeftClickIn(rect))
+            BeginListening(move.Id);
     }
 
     private bool DrawStyledButton(Rect rect, string text, bool active, bool danger)
     {
         var bg = active ? BadgeBoundCol : CardCol;
-        if (rect.Contains(Event.current.mousePosition))
+        if (rect.Contains(Event.current.mousePosition) && CanAcceptClick())
             bg = CardHoverCol;
 
         var border = active ? CyanCol : (danger ? new Color(0.75f, 0.35f, 0.35f, 1f) : CardBorderCol);
@@ -373,7 +442,8 @@ public sealed class KeybindMenuUi
         _btnStyle!.normal.textColor = active ? CyanCol : (danger ? new Color(0.96f, 0.64f, 0.64f, 1f) : TextCol);
         _btnStyle.fontSize = 12;
         _btnStyle.fontStyle = active ? FontStyle.Bold : FontStyle.Normal;
-        return GUI.Button(rect, text, _btnStyle);
+        GUI.Label(rect, text, _btnStyle);
+        return IsControlLeftClickIn(rect);
     }
 
     private static int CountBound(int actorId, BindingStore store)
@@ -422,8 +492,6 @@ public sealed class KeybindMenuUi
         _solidStyle.hover.background = whiteTex;
         _solidStyle.active.background = whiteTex;
         _solidStyle.focused.background = whiteTex;
-
-        _clearStyle = new GUIStyle(GUIStyle.none);
 
         _kickerStyle = new GUIStyle(GUIStyle.none)
         {

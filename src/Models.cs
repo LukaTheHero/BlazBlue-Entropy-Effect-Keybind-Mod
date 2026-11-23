@@ -11,8 +11,10 @@ public enum InputActionKind
     Dash,
     Jump,
     Special,
-    Ultra,
+    Special2,
     Summon,
+    Dynamic,
+    Ultra,
     CustomUse1,
     CustomUse2
 }
@@ -90,7 +92,12 @@ public sealed class MoveDefinition
     public string Description { get; set; } = string.Empty;
     public MoveCategory Category { get; init; }
     public uint RequiredPotentialId { get; set; }
-    public uint[] ReplacesActionIds { get; init; } = Array.Empty<uint>();
+    public uint[] RequiredPotentialIds { get; set; } = Array.Empty<uint>();
+    public uint[][] ComboPotentialSets { get; set; } = Array.Empty<uint[]>();
+    public bool IsBaseMove { get; set; } = true;
+    public bool RequiresAirborne { get; set; }
+    public int RepeatCooldownMs { get; set; } = 55;
+    public uint[] ReplacesActionIds { get; set; } = Array.Empty<uint>();
     public uint ActionConfId { get; set; }
     public bool HoldToRepeat { get; init; }
     public bool IsPreset { get; init; }
@@ -99,22 +106,60 @@ public sealed class MoveDefinition
 
     public bool IsUnlockedInRun(RuntimeStateSnapshot snapshot)
     {
-        if (!snapshot.InBattle)
-            return true;
-
-        if (RequiredPotentialId != 0 && !snapshot.ActivePotentials.Contains(RequiredPotentialId))
-            return false;
-
-        if (ActionConfId != 0 && snapshot.DiscoveredActionsByActor.TryGetValue(ActorId, out var actions))
+        if (snapshot.InBattle && snapshot.ActiveActorId == ActorId)
         {
-            foreach (var act in actions)
+            if (ActionConfId != 0 && snapshot.FesActorId == ActorId && snapshot.ObtainedActionIds.Count > 0)
             {
-                if (act.FromPotential != 0 && Array.IndexOf(act.Replace, ActionConfId) >= 0 && snapshot.ActivePotentials.Contains(act.FromPotential))
+                if (!snapshot.ObtainedActionIds.Contains(ActionConfId))
                     return false;
+
+                if (snapshot.DiscoveredActionsByActor.TryGetValue(ActorId, out var actions))
+                {
+                    foreach (var act in actions)
+                    {
+                        if (Array.IndexOf(act.Replace, ActionConfId) >= 0 && snapshot.ObtainedActionIds.Contains(act.Id))
+                            return false;
+                    }
+                }
+
+                return true;
             }
+
+            if (IsBaseMove && RequiredPotentialId == 0 && RequiredPotentialIds.Length == 0 && ComboPotentialSets.Length == 0)
+                return true;
+
+            if (RequiredPotentialId != 0 && snapshot.ActivePotentials.Contains(RequiredPotentialId))
+                return true;
+
+            for (int i = 0; i < RequiredPotentialIds.Length; i++)
+            {
+                if (snapshot.ActivePotentials.Contains(RequiredPotentialIds[i]))
+                    return true;
+            }
+
+            for (int i = 0; i < ComboPotentialSets.Length; i++)
+            {
+                var set = ComboPotentialSets[i];
+                if (set.Length == 0)
+                    continue;
+
+                bool allOwned = true;
+                for (int j = 0; j < set.Length; j++)
+                {
+                    if (!snapshot.ActivePotentials.Contains(set[j]))
+                    {
+                        allOwned = false;
+                        break;
+                    }
+                }
+                if (allOwned)
+                    return true;
+            }
+
+            return false;
         }
 
-        return true;
+        return IsBaseMove && RequiredPotentialId == 0 && RequiredPotentialIds.Length == 0 && ComboPotentialSets.Length == 0;
     }
 }
 
@@ -123,12 +168,14 @@ public sealed class DiscoveredActionInfo
     public uint Id { get; init; }
     public int ActorId { get; init; }
     public int Type { get; init; }
-    public string[] Buttons { get; init; } = Array.Empty<string>();
-    public uint FromPotential { get; init; }
-    public uint FromPotentialCombo { get; init; }
+    public string InputRaw { get; init; } = string.Empty;
+    public string Description { get; init; } = string.Empty;
+    public bool IsBase { get; init; }
+    public uint[] PotentialIds { get; init; } = Array.Empty<uint>();
+    public uint[][] ComboPotentialSets { get; init; } = Array.Empty<uint[]>();
     public uint[] Replace { get; init; } = Array.Empty<uint>();
+    public uint[] Inherit { get; init; } = Array.Empty<uint>();
     public bool IsUltra { get; init; }
-    public bool ShowInBattle { get; init; }
     public int SortOrder { get; init; }
     public string[] Labels { get; init; } = Array.Empty<string>();
     public string Name { get; init; } = string.Empty;
@@ -146,9 +193,11 @@ public sealed class DiscoveredInstructionInfo
 public sealed class RuntimeStateSnapshot
 {
     public int ActiveActorId { get; set; }
+    public int FesActorId { get; set; }
     public bool InBattle { get; set; }
     public bool InputLocked { get; set; }
     public HashSet<uint> ActivePotentials { get; } = new();
+    public HashSet<uint> ObtainedActionIds { get; } = new();
     public HashSet<int> UnlockedFighters { get; } = new();
     public bool CatalogLoaded { get; set; }
     public Dictionary<int, List<DiscoveredActionInfo>> DiscoveredActionsByActor { get; } = new();

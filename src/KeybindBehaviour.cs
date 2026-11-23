@@ -19,6 +19,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
     private bool _releasingMenu;
     private float _nextJsPollTime;
     private int _lastSyncedActorId;
+    private KeyCode _waitReleaseAfterBind = KeyCode.None;
 
     private bool _savedCursorState;
     private bool _prevCursorVisible;
@@ -79,12 +80,14 @@ public sealed class KeybindBehaviour : MonoBehaviour
                     Id = item.TryGetProperty("id", out var idEl) ? idEl.GetUInt32() : 0,
                     ActorId = actorId,
                     Type = item.TryGetProperty("type", out var tEl) ? tEl.GetInt32() : 0,
-                    Buttons = ReadStringArray(item, "buttons"),
-                    FromPotential = item.TryGetProperty("fromPotential", out var fpEl) ? fpEl.GetUInt32() : 0,
-                    FromPotentialCombo = item.TryGetProperty("fromPotentialCombo", out var fpcEl) ? fpcEl.GetUInt32() : 0,
+                    InputRaw = item.TryGetProperty("inputRaw", out var irEl) ? (irEl.GetString() ?? string.Empty) : string.Empty,
+                    Description = item.TryGetProperty("desc", out var dEl) ? (dEl.GetString() ?? string.Empty) : string.Empty,
+                    IsBase = item.TryGetProperty("isBase", out var ibEl) && ibEl.GetBoolean(),
+                    PotentialIds = ReadUIntArray(item, "potentialIds"),
+                    ComboPotentialSets = ReadUIntMatrix(item, "comboPotentialSets"),
                     Replace = ReadUIntArray(item, "replace"),
+                    Inherit = ReadUIntArray(item, "inherit"),
                     IsUltra = item.TryGetProperty("isUltra", out var uEl) && uEl.GetBoolean(),
-                    ShowInBattle = item.TryGetProperty("showInBattle", out var sEl) && sEl.GetBoolean(),
                     SortOrder = item.TryGetProperty("sortOrder", out var soEl) ? soEl.GetInt32() : 0,
                     Labels = ReadStringArray(item, "labels"),
                     Name = item.TryGetProperty("name", out var nEl) ? (nEl.GetString() ?? string.Empty) : string.Empty
@@ -92,7 +95,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
                 if (!_snapshot.DiscoveredActionsByActor.TryGetValue(actorId, out var list))
                 {
-                    list = new System.Collections.Generic.List<DiscoveredActionInfo>();
+                    list = new List<DiscoveredActionInfo>();
                     _snapshot.DiscoveredActionsByActor[actorId] = list;
                 }
                 list.Add(info);
@@ -125,18 +128,8 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
     private void ApplyStatePayload(System.Text.Json.JsonElement root)
     {
-        if (root.TryGetProperty("activeActorId", out var actorEl))
-        {
-            int jsActor = actorEl.GetInt32();
-            if (jsActor != 0)
-                _snapshot.ActiveActorId = jsActor;
-        }
-
-        if (root.TryGetProperty("inBattle", out var inBattleEl))
-            _snapshot.InBattle = inBattleEl.GetBoolean();
-
-        if (root.TryGetProperty("inputLocked", out var lockEl))
-            _snapshot.InputLocked = lockEl.GetBoolean();
+        if (root.TryGetProperty("fesActorId", out var fesEl))
+            _snapshot.FesActorId = fesEl.GetInt32();
 
         _snapshot.ActivePotentials.Clear();
         if (root.TryGetProperty("potentials", out var potsEl) && potsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
@@ -146,6 +139,17 @@ public sealed class KeybindBehaviour : MonoBehaviour
                 uint pid = p.GetUInt32();
                 if (pid > 0)
                     _snapshot.ActivePotentials.Add(pid);
+            }
+        }
+
+        _snapshot.ObtainedActionIds.Clear();
+        if (root.TryGetProperty("obtainedActionIds", out var oaEl) && oaEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            foreach (var a in oaEl.EnumerateArray())
+            {
+                uint aid = a.GetUInt32();
+                if (aid > 0)
+                    _snapshot.ObtainedActionIds.Add(aid);
             }
         }
 
@@ -166,24 +170,28 @@ public sealed class KeybindBehaviour : MonoBehaviour
             return;
         }
 
-        // 1. Read live C# state directly every frame (zero lag across Tag Team swaps)
+        // 1. Read live C# combat state directly every frame (only playable fighters count as InBattle)
         int playerId = 0;
         float facing = 1f;
         bool csharpInBattle = false;
         bool csharpLocked = false;
         int csharpActorId = 0;
+        bool isAirborne = false;
 
         try
         {
             var battle = BattleBase.Cur;
             var player = battle?.PlayerSelf;
-            if (battle != null && player != null)
+            if (battle != null && player != null && CharacterCatalog.FindCharacter(player.BaseID) != null)
             {
                 csharpInBattle = true;
                 csharpActorId = player.BaseID;
                 facing = player.Dir;
+                isAirborne = player.ActorPosition?.IsOffGround ?? false;
                 if (player.Input != null)
                     playerId = player.Input.PlayerId;
+
+                InputSequencer.ActivePlayerId = playerId;
 
                 var gim = SingletonBehaviour<GameInputManager>.Instance;
                 if (gim != null)
@@ -209,7 +217,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
             Plugin.RequestJsSnapshot(false);
         }
 
-        // 2. Menu toggle hotkey (default F4)
+        // 2. Menu toggle hotkey (default F4) & deferred release guard
         var menuKey = Plugin.MenuKey?.Value ?? KeyCode.F4;
         if (_releasingMenu)
         {
@@ -245,7 +253,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
         }
 
         var specialOverride = Plugin.SpecialCmdOverride?.Value ?? "Auto";
-        _sequencer.Update(playerId, csharpActorId, csharpLocked, facing, specialOverride);
+        _sequencer.Update(playerId, csharpActorId, csharpLocked, facing, specialOverride, isAirborne);
 
         if (Plugin.Bindings == null)
             return;
@@ -263,7 +271,8 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
             if (UnityEngine.Input.GetKeyDown(key))
             {
-                _sequencer.Start(move, key, playerId, facing, specialOverride);
+                bool repeatWhileHeld = Plugin.Bindings.GetHoldRepeat(move);
+                _sequencer.Start(move, key, playerId, facing, specialOverride, repeatWhileHeld, isAirborne);
                 break;
             }
         }
@@ -317,6 +326,9 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
         _releasingMenu = false;
         _menuOpen = true;
+        _waitReleaseAfterBind = KeyCode.None;
+        _menuUi.ClicksLocked = false;
+        _menuUi.SuppressClicksUntil = 0f;
         _menuUi.CancelListening();
 
         if (_snapshot.InBattle && _snapshot.ActiveActorId != 0)
@@ -342,6 +354,8 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
         _menuOpen = false;
         _releasingMenu = true;
+        _waitReleaseAfterBind = KeyCode.None;
+        _menuUi.ClicksLocked = false;
         _menuUi.CancelListening();
     }
 
@@ -354,6 +368,9 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
         _menuOpen = false;
         _releasingMenu = false;
+        _waitReleaseAfterBind = KeyCode.None;
+        _menuUi.ClicksLocked = false;
+        _menuUi.SuppressClicksUntil = 0f;
         _menuUi.CancelListening();
         Plugin.SetJsBattlePaused(false);
 
@@ -426,6 +443,20 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
     private void HandleMenuInput()
     {
+        if (_waitReleaseAfterBind != KeyCode.None)
+        {
+            _menuUi.ClicksLocked = true;
+            if (!UnityEngine.Input.GetKey(_waitReleaseAfterBind) && !UnityEngine.Input.GetKey(KeyCode.Mouse0))
+            {
+                _waitReleaseAfterBind = KeyCode.None;
+                _menuUi.ClicksLocked = false;
+            }
+            else
+            {
+                return;
+            }
+        }
+
         if (_menuUi.ListeningMoveId == null)
         {
             if (UnityEngine.Input.GetKeyDown(KeyCode.Escape))
@@ -444,6 +475,9 @@ public sealed class KeybindBehaviour : MonoBehaviour
         {
             Plugin.Bindings?.SetBinding(_menuUi.ListeningMoveId, KeyCode.None);
             _menuUi.CancelListening();
+            _waitReleaseAfterBind = KeyCode.Escape;
+            _menuUi.ClicksLocked = true;
+            _menuUi.SuppressClicksUntil = Time.realtimeSinceStartup + 0.18f;
             return;
         }
 
@@ -459,6 +493,9 @@ public sealed class KeybindBehaviour : MonoBehaviour
             {
                 Plugin.Bindings?.SetBinding(_menuUi.ListeningMoveId, kc);
                 _menuUi.CancelListening();
+                _waitReleaseAfterBind = kc;
+                _menuUi.ClicksLocked = true;
+                _menuUi.SuppressClicksUntil = Time.realtimeSinceStartup + 0.18f;
                 return;
             }
         }
@@ -481,7 +518,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
         if (!obj.TryGetProperty(prop, out var el) || el.ValueKind != System.Text.Json.JsonValueKind.Array)
             return Array.Empty<string>();
 
-        var list = new System.Collections.Generic.List<string>();
+        var list = new List<string>();
         foreach (var v in el.EnumerateArray())
             list.Add(v.GetString() ?? string.Empty);
         return list.ToArray();
@@ -492,9 +529,29 @@ public sealed class KeybindBehaviour : MonoBehaviour
         if (!obj.TryGetProperty(prop, out var el) || el.ValueKind != System.Text.Json.JsonValueKind.Array)
             return Array.Empty<uint>();
 
-        var list = new System.Collections.Generic.List<uint>();
+        var list = new List<uint>();
         foreach (var v in el.EnumerateArray())
             list.Add(v.GetUInt32());
         return list.ToArray();
+    }
+
+    private static uint[][] ReadUIntMatrix(System.Text.Json.JsonElement obj, string prop)
+    {
+        if (!obj.TryGetProperty(prop, out var el) || el.ValueKind != System.Text.Json.JsonValueKind.Array)
+            return Array.Empty<uint[]>();
+
+        var outer = new List<uint[]>();
+        foreach (var innerEl in el.EnumerateArray())
+        {
+            if (innerEl.ValueKind != System.Text.Json.JsonValueKind.Array)
+                continue;
+
+            var row = new List<uint>();
+            foreach (var v in innerEl.EnumerateArray())
+                row.Add(v.GetUInt32());
+            if (row.Count > 0)
+                outer.Add(row.ToArray());
+        }
+        return outer.ToArray();
     }
 }
