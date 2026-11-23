@@ -51,6 +51,10 @@
       <HintPath>$(GameDir)\BepInEx\interop\Il2CppSystem.Core.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Localization">
+      <HintPath>$(GameDir)\BepInEx\interop\Localization.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="NOAH.Core.Runtime">
       <HintPath>$(GameDir)\BepInEx\interop\NOAH.Core.Runtime.dll</HintPath>
       <Private>false</Private>

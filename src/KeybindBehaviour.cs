@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using GamePlay;
+using Localization;
 using NOAH.Core;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -11,6 +13,9 @@ public sealed class KeybindBehaviour : MonoBehaviour
 {
     public KeybindBehaviour(IntPtr ptr) : base(ptr) { }
 
+    private static readonly Regex RichTagRegex = new(@"</?(?:color|size|voffset|font|combo|dynamic)(?:=[^>]*)?>|<br\s*/?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex InlineActionTagRegex = new(@"<action=([^>]+)>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private readonly InputSequencer _sequencer = new();
     private readonly KeybindMenuUi _menuUi = new();
     private readonly RuntimeStateSnapshot _snapshot = new();
@@ -18,6 +23,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
     private bool _menuOpen;
     private bool _releasingMenu;
     private float _nextJsPollTime;
+    private float _nextCatalogRetryTime;
     private int _lastSyncedActorId;
     private KeyCode _waitReleaseAfterBind = KeyCode.None;
 
@@ -67,39 +73,115 @@ public sealed class KeybindBehaviour : MonoBehaviour
         _snapshot.DiscoveredActionsByActor.Clear();
         _snapshot.DiscoveredInstructions.Clear();
 
+        LocalizationManager? locMgr = null;
+        try
+        {
+            var inst = LocalizationManager.Instance;
+            if (inst != null && inst.IsValid)
+                locMgr = inst;
+        }
+        catch
+        {
+            locMgr = null;
+        }
+
+        var rawEntries = new List<DiscoveredActionInfo>();
+        var rowById = new Dictionary<uint, DiscoveredActionInfo>();
+        var directNames = new Dictionary<uint, string>();
+
         if (root.TryGetProperty("actions", out var actionsEl) && actionsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
         {
             foreach (var item in actionsEl.EnumerateArray())
             {
                 int actorId = item.TryGetProperty("actorId", out var aEl) ? aEl.GetInt32() : 0;
-                if (actorId == 0)
+                uint id = item.TryGetProperty("id", out var idEl) ? idEl.GetUInt32() : 0;
+                if (actorId == 0 || id == 0)
                     continue;
+
+                string inputRaw = item.TryGetProperty("inputRaw", out var irEl) ? (irEl.GetString() ?? string.Empty) : string.Empty;
+                if (string.IsNullOrWhiteSpace(inputRaw) && locMgr != null)
+                    inputRaw = TryNativeLocale(locMgr, $"ActorActionInput_{id}");
+
+                string name = item.TryGetProperty("name", out var nEl) ? (nEl.GetString() ?? string.Empty) : string.Empty;
+                if (string.IsNullOrWhiteSpace(name) && locMgr != null)
+                {
+                    name = CleanRichText(TryNativeLocale(locMgr, $"ActorActionName_{id}"));
+                    if (string.IsNullOrWhiteSpace(name))
+                        name = CleanRichText(TryNativeLocale(locMgr, $"ActorActionName2_{id}"));
+                }
+
+                string desc = item.TryGetProperty("desc", out var dEl) ? (dEl.GetString() ?? string.Empty) : string.Empty;
+                if (string.IsNullOrWhiteSpace(desc) && locMgr != null)
+                    desc = CleanRichText(TryNativeLocale(locMgr, $"ActorActionDesc_{id}"));
+
+                var inherit = ReadUIntArray(item, "inherit");
+                var potIds = ReadUIntArray(item, "potentialIds");
+
+                if (!string.IsNullOrWhiteSpace(name))
+                    directNames[id] = name;
 
                 var info = new DiscoveredActionInfo
                 {
-                    Id = item.TryGetProperty("id", out var idEl) ? idEl.GetUInt32() : 0,
+                    Id = id,
                     ActorId = actorId,
                     Type = item.TryGetProperty("type", out var tEl) ? tEl.GetInt32() : 0,
-                    InputRaw = item.TryGetProperty("inputRaw", out var irEl) ? (irEl.GetString() ?? string.Empty) : string.Empty,
-                    Description = item.TryGetProperty("desc", out var dEl) ? (dEl.GetString() ?? string.Empty) : string.Empty,
+                    InputRaw = inputRaw,
+                    Description = desc,
                     IsBase = item.TryGetProperty("isBase", out var ibEl) && ibEl.GetBoolean(),
-                    PotentialIds = ReadUIntArray(item, "potentialIds"),
+                    PotentialIds = potIds,
                     ComboPotentialSets = ReadUIntMatrix(item, "comboPotentialSets"),
                     Replace = ReadUIntArray(item, "replace"),
-                    Inherit = ReadUIntArray(item, "inherit"),
+                    Inherit = inherit,
                     IsUltra = item.TryGetProperty("isUltra", out var uEl) && uEl.GetBoolean(),
                     SortOrder = item.TryGetProperty("sortOrder", out var soEl) ? soEl.GetInt32() : 0,
                     Labels = ReadStringArray(item, "labels"),
-                    Name = item.TryGetProperty("name", out var nEl) ? (nEl.GetString() ?? string.Empty) : string.Empty
+                    Name = name
                 };
 
-                if (!_snapshot.DiscoveredActionsByActor.TryGetValue(actorId, out var list))
-                {
-                    list = new List<DiscoveredActionInfo>();
-                    _snapshot.DiscoveredActionsByActor[actorId] = list;
-                }
-                list.Add(info);
+                rawEntries.Add(info);
+                rowById[id] = info;
             }
+        }
+
+        int resolvedCount = 0;
+        for (int i = 0; i < rawEntries.Count; i++)
+        {
+            var entry = rawEntries[i];
+            if (string.IsNullOrWhiteSpace(entry.InputRaw))
+                continue;
+
+            string finalName = entry.Name;
+            if (string.IsNullOrWhiteSpace(finalName) && entry.Inherit.Length > 0)
+                finalName = ResolveNameFromInherit(entry.Inherit, rowById, directNames);
+
+            if (!string.Equals(finalName, entry.Name, StringComparison.Ordinal))
+            {
+                entry = new DiscoveredActionInfo
+                {
+                    Id = entry.Id,
+                    ActorId = entry.ActorId,
+                    Type = entry.Type,
+                    InputRaw = entry.InputRaw,
+                    Description = entry.Description,
+                    IsBase = entry.IsBase,
+                    PotentialIds = entry.PotentialIds,
+                    ComboPotentialSets = entry.ComboPotentialSets,
+                    Replace = entry.Replace,
+                    Inherit = entry.Inherit,
+                    IsUltra = entry.IsUltra,
+                    SortOrder = entry.SortOrder,
+                    Labels = entry.Labels,
+                    Name = finalName
+                };
+            }
+
+            if (!_snapshot.DiscoveredActionsByActor.TryGetValue(entry.ActorId, out var list))
+            {
+                list = new List<DiscoveredActionInfo>();
+                _snapshot.DiscoveredActionsByActor[entry.ActorId] = list;
+            }
+            list.Add(entry);
+            resolvedCount++;
         }
 
         if (root.TryGetProperty("instructions", out var instEl) && instEl.ValueKind == System.Text.Json.JsonValueKind.Array)
@@ -117,13 +199,83 @@ public sealed class KeybindBehaviour : MonoBehaviour
             }
         }
 
-        _snapshot.CatalogLoaded = true;
-        CharacterCatalog.MergeDiscoveredCatalog(_snapshot);
-
-        if (Plugin.LogDiscoveredCatalog?.Value == true)
+        if (resolvedCount > 0 && _snapshot.DiscoveredActionsByActor.Count > 0)
         {
-            Plugin.LogInstance?.LogInfo($"Discovered {_snapshot.DiscoveredActionsByActor.Count} character action tables and {_snapshot.DiscoveredInstructions.Count} instruction rules.");
+            _snapshot.CatalogLoaded = true;
+            CharacterCatalog.MergeDiscoveredCatalog(_snapshot);
+            Plugin.LogInstance?.LogInfo($"Synced BBEE catalog: {resolvedCount} localized actions across {_snapshot.DiscoveredActionsByActor.Count} fighters -> {CharacterCatalog.TotalMoveCount} total bindable moves ({_snapshot.DiscoveredInstructions.Count} chant rules).");
         }
+        else
+        {
+            _snapshot.CatalogLoaded = false;
+            Plugin.LogInstance?.LogDebug($"Catalog poll deferred (raw={rawEntries.Count}, resolved={resolvedCount}, locValid={locMgr != null}).");
+        }
+    }
+
+    private static string TryNativeLocale(LocalizationManager mgr, string key)
+    {
+        try
+        {
+            if (!mgr.IsExist(key))
+                return string.Empty;
+            string s = mgr.GetString(key);
+            return !string.IsNullOrEmpty(s) && s != key ? s : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string CleanRichText(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return string.Empty;
+
+        string s = RichTagRegex.Replace(raw, " ");
+        s = InlineActionTagRegex.Replace(s, m => m.Groups[1].Value switch
+        {
+            "MoveY+" => "Up",
+            "MoveY-" => "Down",
+            "MoveX+" => "Right",
+            "MoveX-" => "Left",
+            "MoveX" => "Forward",
+            "MoveY" => "Up/Down",
+            "Summon" => "SP",
+            "SpecialAction1" => "Special",
+            "SpecialAction2" => "Special 2",
+            "Dynamic" => "SP",
+            _ => m.Groups[1].Value
+        });
+        return Regex.Replace(s, @"\s+", " ").Trim();
+    }
+
+    private static string ResolveNameFromInherit(
+        uint[] initialInherit,
+        Dictionary<uint, DiscoveredActionInfo> rowById,
+        Dictionary<uint, string> directNames)
+    {
+        var visited = new HashSet<uint>();
+        var queue = new Queue<uint>(initialInherit);
+        int hops = 0;
+
+        while (queue.Count > 0 && hops++ < 10)
+        {
+            uint cur = queue.Dequeue();
+            if (cur == 0 || !visited.Add(cur))
+                continue;
+
+            if (directNames.TryGetValue(cur, out var nm) && !string.IsNullOrWhiteSpace(nm))
+                return nm;
+
+            if (rowById.TryGetValue(cur, out var parent))
+            {
+                for (int i = 0; i < parent.Inherit.Length; i++)
+                    queue.Enqueue(parent.Inherit[i]);
+            }
+        }
+
+        return string.Empty;
     }
 
     private void ApplyStatePayload(System.Text.Json.JsonElement root)
@@ -168,6 +320,25 @@ public sealed class KeybindBehaviour : MonoBehaviour
             if (_menuOpen || _releasingMenu)
                 ReleaseMenuImmediate();
             return;
+        }
+
+        // Poll until game Xlsx + LocalizationManager finish loading after boot
+        if (!_snapshot.CatalogLoaded && Time.realtimeSinceStartup >= _nextCatalogRetryTime)
+        {
+            _nextCatalogRetryTime = Time.realtimeSinceStartup + 1.5f;
+            bool locValid = false;
+            try
+            {
+                var loc = LocalizationManager.Instance;
+                locValid = loc != null && loc.IsValid;
+            }
+            catch
+            {
+                locValid = false;
+            }
+
+            if (locValid)
+                Plugin.RequestJsSnapshot(true);
         }
 
         // 1. Read live C# combat state directly every frame (only playable fighters count as InBattle)
@@ -334,7 +505,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
         if (_snapshot.InBattle && _snapshot.ActiveActorId != 0)
             _menuUi.SelectedCharacterId = _snapshot.ActiveActorId;
 
-        Plugin.RequestJsSnapshot(false);
+        Plugin.RequestJsSnapshot(!_snapshot.CatalogLoaded);
         Plugin.SetJsBattlePaused(true);
 
         if (!_savedCursorState)

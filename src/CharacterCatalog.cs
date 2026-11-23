@@ -58,6 +58,17 @@ public static class CharacterCatalog
         return MovesByActor.TryGetValue(actorId, out var list) ? list : Array.Empty<MoveDefinition>();
     }
 
+    public static int TotalMoveCount
+    {
+        get
+        {
+            int sum = 0;
+            foreach (var kvp in MovesByActor)
+                sum += kvp.Value.Count;
+            return sum;
+        }
+    }
+
     public static void ResetToPresets(bool includeFallbackStandardCombos = true)
     {
         MovesByActor.Clear();
@@ -142,6 +153,16 @@ public static class CharacterCatalog
                 string title = !string.IsNullOrWhiteSpace(act.Name)
                     ? act.Name
                     : BuildFallbackActionName(act, hint);
+
+                bool rawIsHold = act.InputRaw.IndexOf("Hold", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (rawIsHold && act.Type == 2 && title.IndexOf("Hold", StringComparison.OrdinalIgnoreCase) < 0)
+                    title += " (Hold)";
+                if (requiresAirborne && act.Inherit.Length > 0
+                    && title.IndexOf("Air", StringComparison.OrdinalIgnoreCase) < 0
+                    && title.IndexOf("Aer", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    title += " (Air)";
+                }
 
                 string dedupeKey = $"{canonicalKey}||{title.Trim()}";
                 if (!seenDiscovered.Add(dedupeKey))
@@ -924,6 +945,8 @@ public static class CharacterCatalog
             return null;
 
         string s = inputRaw.Trim();
+        if (s.EndsWith(".", StringComparison.Ordinal))
+            return null;
         if (s.IndexOf("[Airborne]", StringComparison.OrdinalIgnoreCase) >= 0)
             requiresAirborne = true;
 

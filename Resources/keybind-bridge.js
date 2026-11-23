@@ -69,35 +69,38 @@
             return out;
         }
 
-        let cachedLocMgr = null;
         function getLocMgr() {
-            if (cachedLocMgr) return cachedLocMgr;
             try {
-                if (U && CS && CS.Localization && CS.Localization.LocalizationManager) {
-                    cachedLocMgr = U.GetSingleton(CS.Localization.LocalizationManager);
+                if (CS && CS.Localization && CS.Localization.LocalizationManager) {
+                    return CS.Localization.LocalizationManager.Instance || null;
                 }
             } catch (_) { }
-            return cachedLocMgr;
+            return null;
+        }
+
+        function isLocReady() {
+            const mgr = getLocMgr();
+            if (!mgr) return false;
+            try { return Boolean(mgr.IsValid); } catch (_) { return false; }
         }
 
         function tryLocaleStrict(key) {
             if (key === null || key === undefined || key === '' || key === 0) return '';
             const k = String(key);
+            const mgr = getLocMgr();
+            if (mgr) {
+                try {
+                    if (typeof mgr.IsExist === 'function' && !mgr.IsExist(k)) return '';
+                    if (typeof mgr.GetString === 'function') {
+                        const t = mgr.GetString(k);
+                        if (typeof t === 'string' && t && t !== k) return t;
+                    }
+                } catch (_) { }
+            }
             try {
-                const mgr = getLocMgr();
-                if (mgr && typeof mgr.IsExist === 'function' && !mgr.IsExist(k)) {
-                    return '';
-                }
-            } catch (_) { }
-            try {
+                if (U && typeof U.ExistLocale === 'function' && !U.ExistLocale(k)) return '';
                 if (U && typeof U.GetLocale === 'function') {
                     const t = U.GetLocale(k);
-                    if (typeof t === 'string' && t && t !== k) return t;
-                }
-            } catch (_) { }
-            try {
-                if (U && typeof U.GetText === 'function') {
-                    const t = U.GetText(k);
                     if (typeof t === 'string' && t && t !== k) return t;
                 }
             } catch (_) { }
@@ -181,100 +184,151 @@
             return { potentialsByAction, comboSetsByAction, potNameById };
         }
 
+        function resolveInheritedName(id, rowMap, actionNameById, potIds, potNameById) {
+            const direct = actionNameById.get(id);
+            if (direct) return direct;
+
+            const visited = new Set([id]);
+            const queue = [];
+            const rootRow = rowMap.get(id);
+            if (rootRow) {
+                for (const inh of rootRow.inherit) queue.push(inh);
+            }
+
+            let hops = 0;
+            while (queue.length > 0 && hops++ < 8) {
+                const cur = queue.shift();
+                if (!cur || visited.has(cur)) continue;
+                visited.add(cur);
+
+                const nm = actionNameById.get(cur);
+                if (nm) return nm;
+
+                const curRow = rowMap.get(cur);
+                if (curRow) {
+                    for (const inh of curRow.inherit) queue.push(inh);
+                }
+            }
+
+            if (potIds && potIds.length > 0) {
+                for (const pid of potIds) {
+                    if (potNameById.has(pid)) return potNameById.get(pid);
+                }
+            }
+            return '';
+        }
+
         function sendCatalog(force) {
             if (catalogSent && !force) return;
+            if (!X || !isLocReady()) return;
+
+            const allActions = readList(X.ActorActionConf && X.ActorActionConf.All);
+            if (!allActions.length) return;
+
             const actions = [];
             const instructions = [];
 
             try {
-                if (X) {
-                    const { potentialsByAction, comboSetsByAction, potNameById } = buildPotentialMaps();
-                    const allActions = readList(X.ActorActionConf && X.ActorActionConf.All);
-                    const actionNameById = new Map();
+                const { potentialsByAction, comboSetsByAction, potNameById } = buildPotentialMaps();
+                const rowMap = new Map();
+                const actionNameById = new Map();
 
-                    for (const row of allActions) {
-                        if (!row || row.close || Number(row.type) !== 1) continue;
-                        const id = Number(row.id) >>> 0;
-                        if (!id) continue;
-                        const nm = cleanDesc(tryLocaleStrict('ActorActionName_' + id));
-                        if (nm) actionNameById.set(id, nm);
-                    }
+                for (const row of allActions) {
+                    if (!row || row.close) continue;
+                    const id = Number(row.id) >>> 0;
+                    if (!id) continue;
 
-                    for (const row of allActions) {
-                        if (!row || row.close || Number(row.type) !== 1) continue;
-                        const id = Number(row.id) >>> 0;
-                        if (!id) continue;
+                    const inheritIds = readList(row.inherit).map(n => Number(n) >>> 0).filter(n => n > 0);
+                    const replaceIds = readList(row.replace).map(n => Number(n) >>> 0).filter(n => n > 0);
+                    rowMap.set(id, { row: row, inherit: inheritIds, replace: replaceIds });
 
-                        const inputRaw = tryLocaleStrict('ActorActionInput_' + id);
-                        if (!inputRaw) continue;
+                    const nm = cleanDesc(
+                        tryLocaleStrict('ActorActionName_' + id)
+                        || tryLocaleStrict('ActorActionName2_' + id)
+                    );
+                    if (nm) actionNameById.set(id, nm);
+                }
 
-                        const inheritIds = readList(row.inherit).map(n => Number(n) >>> 0).filter(n => n > 0);
-                        const replaceIds = readList(row.replace).map(n => Number(n) >>> 0).filter(n => n > 0);
-                        const labels = readList(row.label).map(l => cleanDesc(tryLocaleStrict(String(l)) || String(l))).filter(Boolean);
+                for (const [id, entry] of rowMap.entries()) {
+                    const row = entry.row;
+                    const type = Number(row.type) || 0;
+                    const inputRaw = tryLocaleStrict('ActorActionInput_' + id);
+                    if (!inputRaw) continue;
+
+                    const potIds = potentialsByAction.get(id) || [];
+                    const comboSets = comboSetsByAction.get(id) || [];
+                    const isBase = potIds.length === 0 && comboSets.length === 0;
+                    const name = resolveInheritedName(id, rowMap, actionNameById, potIds, potNameById);
+                    const labels = readList(row.label).map(l => cleanDesc(tryLocaleStrict(String(l)) || String(l))).filter(Boolean);
+                    const desc = cleanDesc(tryLocaleStrict('ActorActionDesc_' + id));
+
+                    actions.push({
+                        id: id,
+                        actorId: Number(row.actorId) || 0,
+                        type: type,
+                        name: name,
+                        inputRaw: inputRaw,
+                        desc: desc,
+                        isBase: isBase,
+                        potentialIds: potIds,
+                        comboPotentialSets: comboSets,
+                        replace: entry.replace,
+                        inherit: entry.inherit,
+                        isUltra: Boolean(row.isUltraSkill),
+                        sortOrder: Number(row.sortOrder) || 0,
+                        labels: labels
+                    });
+                }
+
+                // Fallback: if JS localization checks returned empty despite Xlsx rows existing,
+                // emit raw rows so C# LocalizationManager.Instance can resolve all strings natively.
+                if (actions.length === 0 && rowMap.size > 0) {
+                    for (const [id, entry] of rowMap.entries()) {
+                        const row = entry.row;
                         const potIds = potentialsByAction.get(id) || [];
                         const comboSets = comboSetsByAction.get(id) || [];
-                        const isBase = potIds.length === 0 && comboSets.length === 0;
-
-                        let name = actionNameById.get(id) || '';
-                        if (!name && inheritIds.length > 0) {
-                            for (const inh of inheritIds) {
-                                if (actionNameById.has(inh)) {
-                                    name = actionNameById.get(inh);
-                                    break;
-                                }
-                            }
-                        }
-                        if (!name && potIds.length > 0) {
-                            for (const pid of potIds) {
-                                if (potNameById.has(pid)) {
-                                    name = potNameById.get(pid);
-                                    break;
-                                }
-                            }
-                        }
-
-                        const desc = cleanDesc(tryLocaleStrict('ActorActionDesc_' + id));
-
                         actions.push({
                             id: id,
                             actorId: Number(row.actorId) || 0,
-                            type: 1,
-                            name: name,
-                            inputRaw: inputRaw,
-                            desc: desc,
-                            isBase: isBase,
+                            type: Number(row.type) || 0,
+                            name: '',
+                            inputRaw: '',
+                            desc: '',
+                            isBase: potIds.length === 0 && comboSets.length === 0,
                             potentialIds: potIds,
                             comboPotentialSets: comboSets,
-                            replace: replaceIds,
-                            inherit: inheritIds,
+                            replace: entry.replace,
+                            inherit: entry.inherit,
                             isUltra: Boolean(row.isUltraSkill),
                             sortOrder: Number(row.sortOrder) || 0,
-                            labels: labels
+                            labels: []
                         });
                     }
+                }
 
-                    const allInst = readList(X.ActionInstructionMatchConfig && X.ActionInstructionMatchConfig.All);
-                    for (const row of allInst) {
-                        if (!row) continue;
-                        instructions.push({
-                            id: Number(row.id) || 0,
-                            instruction: String(row.instruction || ''),
-                            successAction: String(row.successAction || ''),
-                            actionCd: Number(row.actionCd) || 0,
-                            triggerId: Number(row.triggerId) || 0
-                        });
-                    }
+                const allInst = readList(X.ActionInstructionMatchConfig && X.ActionInstructionMatchConfig.All);
+                for (const row of allInst) {
+                    if (!row) continue;
+                    instructions.push({
+                        id: Number(row.id) || 0,
+                        instruction: String(row.instruction || ''),
+                        successAction: String(row.successAction || ''),
+                        actionCd: Number(row.actionCd) || 0,
+                        triggerId: Number(row.triggerId) || 0
+                    });
                 }
             } catch (ex) {
                 logMsg('WARN', 'Catalog build partial error: ' + (ex && ex.message ? ex.message : ex));
             }
 
-            catalogSent = true;
-            emit({
-                kind: 'catalog',
-                actions: actions,
-                instructions: instructions
-            });
+            if (actions.length > 0) {
+                catalogSent = true;
+                emit({
+                    kind: 'catalog',
+                    actions: actions,
+                    instructions: instructions
+                });
+            }
         }
 
         function resolveFesActor(js) {
