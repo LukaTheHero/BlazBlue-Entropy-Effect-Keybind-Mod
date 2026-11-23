@@ -23,6 +23,7 @@ public sealed class KeybindMenuUi
     private static readonly Color BadgeIdleCol = new(0.13f, 0.18f, 0.26f, 1f);
     private static readonly Color BadgeBoundCol = new(0.12f, 0.36f, 0.44f, 1f);
 
+    private GUIStyle? _solidStyle;
     private GUIStyle? _kickerStyle;
     private GUIStyle? _titleStyle;
     private GUIStyle? _subStyle;
@@ -59,179 +60,241 @@ public sealed class KeybindMenuUi
         Action<bool> onToggleHud,
         Action onClose)
     {
-        EnsureStyles();
-
-        float sw = Screen.width;
-        float sh = Screen.height;
-
-        // Fullscreen dim
-        DrawSolid(new Rect(0, 0, sw, sh), BackdropCol);
-
-        float panelW = Mathf.Clamp(sw * 0.82f, 820f, 1140f);
-        float panelH = Mathf.Clamp(sh * 0.84f, 560f, 790f);
-        float px = (sw - panelW) * 0.5f;
-        float py = (sh - panelH) * 0.5f;
-        var panelRect = new Rect(px, py, panelW, panelH);
-
-        DrawBox(panelRect, PanelCol, PanelBorderCol, 2f);
-
-        float pad = 22f;
-        float contentW = panelW - pad * 2f;
-
-        // Header
-        GUI.Label(new Rect(px + pad, py + 14f, 420f, 18f), "KEYBIND MOD / SKILL KEYBINDS", _kickerStyle!);
-        GUI.Label(new Rect(px + pad, py + 32f, 460f, 32f), "Assign Skills & Combos", _titleStyle!);
-
-        string liveLabel = snapshot.InBattle
-            ? $"ACTIVE IN RUN: {CharacterCatalog.GetCharacterName(snapshot.ActiveActorId).ToUpperInvariant()}"
-            : "OUT OF BATTLE (SELECT ANY FIGHTER TO EDIT)";
-        var liveColor = snapshot.InBattle ? CyanCol : MutedCol;
-        _subStyle!.normal.textColor = liveColor;
-        _subStyle.alignment = TextAnchor.MiddleRight;
-        GUI.Label(new Rect(px + panelW - pad - 440f, py + 24f, 385f, 24f), liveLabel, _subStyle);
-
-        if (DrawStyledButton(new Rect(px + panelW - pad - 42f, py + 18f, 42f, 34f), "X", false, false))
+        var oldMatrix = GUI.matrix;
+        var oldColor = GUI.color;
+        var oldBg = GUI.backgroundColor;
+        var oldEnabled = GUI.enabled;
+        var oldDepth = GUI.depth;
+        try
         {
-            CancelListening();
-            onClose();
-            return;
-        }
+            EnsureStyles();
+            GUI.enabled = true;
+            GUI.color = Color.white;
+            GUI.backgroundColor = Color.white;
+            GUI.depth = -1000;
 
-        // Character grid (6 columns, 3 rows for 17 fighters)
-        float gridTop = py + 76f;
-        int cols = 6;
-        float gapX = 8f;
-        float gapY = 6f;
-        float chipW = (contentW - gapX * (cols - 1)) / cols;
-        float chipH = 38f;
+            float sw = Screen.width;
+            float sh = Screen.height;
 
-        for (int i = 0; i < CharacterCatalog.Roster.Count; i++)
-        {
-            var fighter = CharacterCatalog.Roster[i];
-            int row = i / cols;
-            int col = i % cols;
-            var r = new Rect(px + pad + col * (chipW + gapX), gridTop + row * (chipH + gapY), chipW, chipH);
+            // Fullscreen dim under identity matrix across physical screen
+            GUI.matrix = Matrix4x4.identity;
+            DrawSolid(new Rect(0f, 0f, sw, sh), BackdropCol);
 
-            bool isSelectedTab = fighter.ActorId == SelectedCharacterId;
-            bool isLiveFighter = snapshot.InBattle && fighter.ActorId == snapshot.ActiveActorId;
-            int boundCount = CountBound(fighter.ActorId, store);
+            // Virtual 1040x680 canvas centered & scaled cleanly for 1080p - 4K
+            const float panelW = 1040f;
+            const float panelH = 680f;
+            float scale = Mathf.Clamp(Math.Min((sw * 0.84f) / panelW, (sh * 0.84f) / panelH), 0.5f, 2.2f);
+            float originX = Mathf.Round((sw - panelW * scale) * 0.5f);
+            float originY = Mathf.Round((sh - panelH * scale) * 0.5f);
+            GUI.matrix = Matrix4x4.TRS(new Vector3(originX, originY, 0f), Quaternion.identity, new Vector3(scale, scale, 1f));
 
-            var bg = isSelectedTab ? CardSelectedCol : CardCol;
-            var border = isSelectedTab ? CyanCol : (isLiveFighter ? GreenCol : CardBorderCol);
-            float bw = (isSelectedTab || isLiveFighter) ? 2f : 1f;
+            const float px = 0f;
+            const float py = 0f;
+            var panelRect = new Rect(px, py, panelW, panelH);
 
-            if (r.Contains(Event.current.mousePosition) && !isSelectedTab)
-                bg = CardHoverCol;
+            DrawBox(panelRect, PanelCol, PanelBorderCol, 2f);
 
-            DrawBox(r, bg, border, bw);
+            const float pad = 22f;
+            float contentW = panelW - pad * 2f;
 
-            string shortName = fighter.ActorId == 102801 ? "No.11" : fighter.DisplayName;
-            string caption = boundCount > 0 ? $"{shortName} [{boundCount}]" : shortName;
-            if (isLiveFighter)
-                caption = "* " + caption;
+            // Header
+            GUI.Label(new Rect(px + pad, py + 14f, 420f, 18f), "KEYBIND MOD / SKILL KEYBINDS", _kickerStyle!);
+            GUI.Label(new Rect(px + pad, py + 32f, 460f, 32f), "Assign Skills & Combos", _titleStyle!);
 
-            _btnStyle!.normal.textColor = isSelectedTab ? CyanCol : (isLiveFighter ? GreenCol : TextCol);
-            _btnStyle.fontSize = 13;
-            _btnStyle.fontStyle = isSelectedTab ? FontStyle.Bold : FontStyle.Normal;
-            if (GUI.Button(r, caption, _btnStyle))
+            string liveLabel = snapshot.InBattle
+                ? $"ACTIVE IN RUN: {CharacterCatalog.GetCharacterName(snapshot.ActiveActorId).ToUpperInvariant()}"
+                : "OUT OF BATTLE (SELECT ANY FIGHTER TO EDIT)";
+            var liveColor = snapshot.InBattle ? CyanCol : MutedCol;
+            _subStyle!.normal.textColor = liveColor;
+            _subStyle.alignment = TextAnchor.MiddleRight;
+            GUI.Label(new Rect(px + panelW - pad - 440f, py + 24f, 385f, 24f), liveLabel, _subStyle);
+
+            if (DrawStyledButton(new Rect(px + panelW - pad - 42f, py + 18f, 42f, 34f), "X", false, false))
             {
                 CancelListening();
-                SelectedCharacterId = fighter.ActorId;
-                _scrollPos = Vector2.zero;
+                onClose();
+                ConsumePointerEvent();
+                return;
             }
-        }
 
-        int rows = (CharacterCatalog.Roster.Count + cols - 1) / cols;
-        float toolbarY = gridTop + rows * (chipH + gapY) + 12f;
+            // Character grid (6 columns, 3 rows for 17 fighters)
+            float gridTop = py + 76f;
+            int cols = 6;
+            float gapX = 8f;
+            float gapY = 6f;
+            float chipW = (contentW - gapX * (cols - 1)) / cols;
+            float chipH = 38f;
 
-        // Filter & Utility Bar
-        var allMoves = CharacterCatalog.GetMoves(SelectedCharacterId);
-        var visibleMoves = new List<MoveDefinition>();
-        for (int i = 0; i < allMoves.Count; i++)
-        {
-            var m = allMoves[i];
-            if (ShowLockedMoves || !snapshot.InBattle || m.IsUnlockedInRun(snapshot))
-                visibleMoves.Add(m);
-        }
-
-        if (DrawStyledButton(new Rect(px + pad, toolbarY, 150f, 30f), $"Unlocked Only", !ShowLockedMoves, false))
-            ShowLockedMoves = false;
-        if (DrawStyledButton(new Rect(px + pad + 158f, toolbarY, 140f, 30f), $"All Moves ({allMoves.Count})", ShowLockedMoves, false))
-            ShowLockedMoves = true;
-        if (DrawStyledButton(new Rect(px + pad + 308f, toolbarY, 160f, 30f), $"HUD Pill: {(showHud ? "ON" : "OFF")}", showHud, false))
-            onToggleHud(!showHud);
-
-        if (DrawStyledButton(new Rect(px + panelW - pad - 170f, toolbarY, 170f, 30f), "Clear Fighter Binds", false, true))
-        {
-            CancelListening();
-            store.ClearCharacterBindings(allMoves);
-        }
-
-        // Scrollable 2-column skill card list
-        float listY = toolbarY + 40f;
-        float footerH = 42f;
-        float listH = (py + panelH) - footerH - listY - 8f;
-        var viewPort = new Rect(px + pad, listY, contentW, listH);
-
-        int skillCols = 2;
-        float sGap = 12f;
-        float cardW = (contentW - 22f - sGap) / skillCols;
-        float cardH = 74f;
-        int sRows = Math.Max(1, (visibleMoves.Count + skillCols - 1) / skillCols);
-        float innerH = Math.Max(listH - 4f, sRows * (cardH + sGap));
-        var innerRect = new Rect(0f, 0f, contentW - 20f, innerH);
-
-        DrawBox(viewPort, new Color(0.04f, 0.06f, 0.10f, 0.7f), CardBorderCol, 1f);
-        _scrollPos = GUI.BeginScrollView(viewPort, _scrollPos, innerRect);
-
-        if (visibleMoves.Count == 0)
-        {
-            _subStyle.normal.textColor = MutedCol;
-            _subStyle.alignment = TextAnchor.MiddleCenter;
-            GUI.Label(new Rect(0, 40f, innerRect.width, 40f), "No unlocked moves detected yet — toggle 'All Moves' to inspect & bind presets.", _subStyle);
-        }
-        else
-        {
-            for (int i = 0; i < visibleMoves.Count; i++)
+            for (int i = 0; i < CharacterCatalog.Roster.Count; i++)
             {
-                var move = visibleMoves[i];
-                int rIdx = i / skillCols;
-                int cIdx = i % skillCols;
-                var cardRect = new Rect(4f + cIdx * (cardW + sGap), 6f + rIdx * (cardH + sGap), cardW, cardH);
+                var fighter = CharacterCatalog.Roster[i];
+                int row = i / cols;
+                int col = i % cols;
+                var r = new Rect(px + pad + col * (chipW + gapX), gridTop + row * (chipH + gapY), chipW, chipH);
 
-                DrawSkillCard(cardRect, move, allMoves, snapshot, store);
+                bool isSelectedTab = fighter.ActorId == SelectedCharacterId;
+                bool isLiveFighter = snapshot.InBattle && fighter.ActorId == snapshot.ActiveActorId;
+                int boundCount = CountBound(fighter.ActorId, store);
+
+                var bg = isSelectedTab ? CardSelectedCol : CardCol;
+                var border = isSelectedTab ? CyanCol : (isLiveFighter ? GreenCol : CardBorderCol);
+                float bw = (isSelectedTab || isLiveFighter) ? 2f : 1f;
+
+                if (r.Contains(Event.current.mousePosition) && !isSelectedTab)
+                    bg = CardHoverCol;
+
+                DrawBox(r, bg, border, bw);
+
+                string shortName = fighter.ActorId == 102801 ? "No.11" : fighter.DisplayName;
+                string caption = boundCount > 0 ? $"{shortName} [{boundCount}]" : shortName;
+                if (isLiveFighter)
+                    caption = "* " + caption;
+
+                _btnStyle!.normal.textColor = isSelectedTab ? CyanCol : (isLiveFighter ? GreenCol : TextCol);
+                _btnStyle.fontSize = 13;
+                _btnStyle.fontStyle = isSelectedTab ? FontStyle.Bold : FontStyle.Normal;
+                if (GUI.Button(r, caption, _btnStyle))
+                {
+                    CancelListening();
+                    SelectedCharacterId = fighter.ActorId;
+                    _scrollPos = Vector2.zero;
+                }
             }
+
+            int rows = (CharacterCatalog.Roster.Count + cols - 1) / cols;
+            float toolbarY = gridTop + rows * (chipH + gapY) + 12f;
+
+            // Filter & Utility Bar
+            var allMoves = CharacterCatalog.GetMoves(SelectedCharacterId);
+            var visibleMoves = new List<MoveDefinition>();
+            for (int i = 0; i < allMoves.Count; i++)
+            {
+                var m = allMoves[i];
+                if (ShowLockedMoves || !snapshot.InBattle || m.IsUnlockedInRun(snapshot))
+                    visibleMoves.Add(m);
+            }
+
+            if (DrawStyledButton(new Rect(px + pad, toolbarY, 150f, 30f), $"Unlocked Only", !ShowLockedMoves, false))
+                ShowLockedMoves = false;
+            if (DrawStyledButton(new Rect(px + pad + 158f, toolbarY, 140f, 30f), $"All Moves ({allMoves.Count})", ShowLockedMoves, false))
+                ShowLockedMoves = true;
+            if (DrawStyledButton(new Rect(px + pad + 308f, toolbarY, 160f, 30f), $"HUD Pill: {(showHud ? "ON" : "OFF")}", showHud, false))
+                onToggleHud(!showHud);
+
+            if (DrawStyledButton(new Rect(px + panelW - pad - 170f, toolbarY, 170f, 30f), "Clear Fighter Binds", false, true))
+            {
+                CancelListening();
+                store.ClearCharacterBindings(allMoves);
+            }
+
+            // Scrollable 2-column skill card list
+            float listY = toolbarY + 40f;
+            float footerH = 42f;
+            float listH = (py + panelH) - footerH - listY - 8f;
+            var viewPort = new Rect(px + pad, listY, contentW, listH);
+
+            int skillCols = 2;
+            float sGap = 12f;
+            float cardW = (contentW - 22f - sGap) / skillCols;
+            float cardH = 74f;
+            int sRows = Math.Max(1, (visibleMoves.Count + skillCols - 1) / skillCols);
+            float innerH = Math.Max(listH - 4f, sRows * (cardH + sGap));
+            var innerRect = new Rect(0f, 0f, contentW - 20f, innerH);
+
+            DrawBox(viewPort, new Color(0.04f, 0.06f, 0.10f, 0.7f), CardBorderCol, 1f);
+            _scrollPos = GUI.BeginScrollView(viewPort, _scrollPos, innerRect);
+
+            if (visibleMoves.Count == 0)
+            {
+                _subStyle.normal.textColor = MutedCol;
+                _subStyle.alignment = TextAnchor.MiddleCenter;
+                GUI.Label(new Rect(0, 40f, innerRect.width, 40f), "No unlocked moves detected yet — toggle 'All Moves' to inspect & bind presets.", _subStyle);
+            }
+            else
+            {
+                for (int i = 0; i < visibleMoves.Count; i++)
+                {
+                    var move = visibleMoves[i];
+                    int rIdx = i / skillCols;
+                    int cIdx = i % skillCols;
+                    var cardRect = new Rect(4f + cIdx * (cardW + sGap), 6f + rIdx * (cardH + sGap), cardW, cardH);
+
+                    DrawSkillCard(cardRect, move, allMoves, snapshot, store);
+                }
+            }
+
+            GUI.EndScrollView();
+
+            // Footer hint bar
+            float footY = py + panelH - footerH + 6f;
+            _subStyle.normal.textColor = MutedCol;
+            _subStyle.alignment = TextAnchor.MiddleLeft;
+            string footText = ListeningMoveId != null
+                ? "LISTENING: Press any Keyboard key or Mouse button (including Mouse 4 / Mouse 5) to bind  |  Esc: Unassign"
+                : $"Click skill card to bind (Keyboard / Mouse 1-7)  |  Esc: Unassign (when binding) / Close  |  {KeyCodeFormatter.Format(menuKey)}: Toggle Menu";
+            if (ListeningMoveId != null)
+                _subStyle.normal.textColor = AmberCol;
+
+            GUI.Label(new Rect(px + pad, footY, contentW, 28f), footText, _subStyle);
+
+            ConsumePointerEvent();
         }
-
-        GUI.EndScrollView();
-
-        // Footer hint bar
-        float footY = py + panelH - footerH + 6f;
-        _subStyle.normal.textColor = MutedCol;
-        _subStyle.alignment = TextAnchor.MiddleLeft;
-        string footText = ListeningMoveId != null
-            ? "LISTENING: Press any Keyboard key or Mouse button (including Mouse 4 / Mouse 5) to bind  |  Esc: Unassign"
-            : $"Click skill card to bind (Keyboard / Mouse 1-7)  |  Esc: Unassign (when binding) / Close  |  {KeyCodeFormatter.Format(menuKey)}: Toggle Menu";
-        if (ListeningMoveId != null)
-            _subStyle.normal.textColor = AmberCol;
-
-        GUI.Label(new Rect(px + pad, footY, contentW, 28f), footText, _subStyle);
+        finally
+        {
+            GUI.matrix = oldMatrix;
+            GUI.color = oldColor;
+            GUI.backgroundColor = oldBg;
+            GUI.enabled = oldEnabled;
+            GUI.depth = oldDepth;
+        }
     }
 
     public void DrawMiniHud(RuntimeStateSnapshot snapshot, BindingStore store)
     {
-        EnsureStyles();
-        string charName = snapshot.InBattle
-            ? CharacterCatalog.GetCharacterName(snapshot.ActiveActorId)
-            : "Menu / Hub";
-        int bound = snapshot.InBattle ? CountBound(snapshot.ActiveActorId, store) : 0;
-        string txt = $"Keybind Mod: {charName} ({bound} bound)  [F4]";
+        var oldMatrix = GUI.matrix;
+        var oldColor = GUI.color;
+        var oldBg = GUI.backgroundColor;
+        var oldEnabled = GUI.enabled;
+        var oldDepth = GUI.depth;
+        try
+        {
+            EnsureStyles();
+            GUI.enabled = true;
+            GUI.color = Color.white;
+            GUI.backgroundColor = Color.white;
+            GUI.depth = -900;
 
-        var rect = new Rect(20f, Screen.height - 46f, 330f, 26f);
-        DrawBox(rect, new Color(0.05f, 0.08f, 0.13f, 0.85f), PanelBorderCol, 1f);
-        _subStyle!.normal.textColor = snapshot.InBattle ? CyanCol : MutedCol;
-        _subStyle.alignment = TextAnchor.MiddleLeft;
-        GUI.Label(new Rect(rect.x + 10f, rect.y, rect.width - 16f, rect.height), txt, _subStyle);
+            float scale = Mathf.Clamp(Screen.height / 1080f, 0.75f, 2f);
+            GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, new Vector3(scale, scale, 1f));
+
+            string charName = snapshot.InBattle
+                ? CharacterCatalog.GetCharacterName(snapshot.ActiveActorId)
+                : "Menu / Hub";
+            int bound = snapshot.InBattle ? CountBound(snapshot.ActiveActorId, store) : 0;
+            string txt = $"Keybind Mod: {charName} ({bound} bound)  [F4]";
+
+            float vHeight = Screen.height / scale;
+            var rect = new Rect(20f, vHeight - 46f, 330f, 26f);
+            DrawBox(rect, new Color(0.05f, 0.08f, 0.13f, 0.85f), PanelBorderCol, 1f);
+            _subStyle!.normal.textColor = snapshot.InBattle ? CyanCol : MutedCol;
+            _subStyle.alignment = TextAnchor.MiddleLeft;
+            GUI.Label(new Rect(rect.x + 10f, rect.y, rect.width - 16f, rect.height), txt, _subStyle);
+        }
+        finally
+        {
+            GUI.matrix = oldMatrix;
+            GUI.color = oldColor;
+            GUI.backgroundColor = oldBg;
+            GUI.enabled = oldEnabled;
+            GUI.depth = oldDepth;
+        }
+    }
+
+    private static void ConsumePointerEvent()
+    {
+        var ev = Event.current;
+        if (ev != null && (ev.type == EventType.MouseDown || ev.type == EventType.MouseUp || ev.type == EventType.ScrollWheel))
+            ev.Use();
     }
 
     private void DrawSkillCard(
@@ -325,15 +388,21 @@ public sealed class KeybindMenuUi
         return count;
     }
 
-    private static void DrawSolid(Rect r, Color col)
+    private void DrawSolid(Rect r, Color col)
     {
-        var prev = GUI.color;
+        if (_solidStyle == null)
+            return;
+
+        var prevColor = GUI.color;
+        var prevBg = GUI.backgroundColor;
         GUI.color = col;
-        GUI.DrawTexture(r, Texture2D.whiteTexture);
-        GUI.color = prev;
+        GUI.backgroundColor = Color.white;
+        GUI.Box(r, string.Empty, _solidStyle);
+        GUI.backgroundColor = prevBg;
+        GUI.color = prevColor;
     }
 
-    private static void DrawBox(Rect r, Color fill, Color border, float bw)
+    private void DrawBox(Rect r, Color fill, Color border, float bw)
     {
         DrawSolid(r, fill);
         DrawSolid(new Rect(r.x, r.y, r.width, bw), border);
@@ -346,6 +415,13 @@ public sealed class KeybindMenuUi
     {
         if (_kickerStyle != null)
             return;
+
+        var whiteTex = Texture2D.whiteTexture;
+        _solidStyle = new GUIStyle(GUIStyle.none);
+        _solidStyle.normal.background = whiteTex;
+        _solidStyle.hover.background = whiteTex;
+        _solidStyle.active.background = whiteTex;
+        _solidStyle.focused.background = whiteTex;
 
         _clearStyle = new GUIStyle(GUIStyle.none);
 

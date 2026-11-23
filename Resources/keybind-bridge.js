@@ -72,6 +72,12 @@
         function tryText(keyOrId) {
             if (keyOrId === null || keyOrId === undefined || keyOrId === '' || keyOrId === 0) return '';
             try {
+                if (U && typeof U.GetLocale === 'function') {
+                    const t = U.GetLocale(keyOrId);
+                    if (typeof t === 'string' && t && t !== String(keyOrId)) return t;
+                }
+            } catch (_) { }
+            try {
                 if (U && typeof U.GetText === 'function') {
                     const t = U.GetText(keyOrId);
                     if (typeof t === 'string' && t && t !== String(keyOrId)) return t;
