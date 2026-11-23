@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using GamePlay;
 using NOAH.Core;
 using UnityEngine;
@@ -15,13 +16,14 @@ public sealed class KeybindBehaviour : MonoBehaviour
     private readonly RuntimeStateSnapshot _snapshot = new();
 
     private bool _menuOpen;
+    private bool _releasingMenu;
     private float _nextJsPollTime;
     private int _lastSyncedActorId;
 
     private bool _savedCursorState;
     private bool _prevCursorVisible;
     private CursorLockMode _prevCursorLock;
-    private bool _prevEventSystemEnabled = true;
+    private readonly List<EventSystem> _blockedEventSystems = new();
 
     internal void ApplyJsMessage(string json)
     {
@@ -158,7 +160,11 @@ public sealed class KeybindBehaviour : MonoBehaviour
     public void Update()
     {
         if (Plugin.Enabled?.Value != true)
+        {
+            if (_menuOpen || _releasingMenu)
+                ReleaseMenuImmediate();
             return;
+        }
 
         // 1. Read live C# state directly every frame (zero lag across Tag Team swaps)
         int playerId = 0;
@@ -205,6 +211,14 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
         // 2. Menu toggle hotkey (default F4)
         var menuKey = Plugin.MenuKey?.Value ?? KeyCode.F4;
+        if (_releasingMenu)
+        {
+            MaintainMenuCursor();
+            if (!IsCloseInputHeld(menuKey))
+                ReleaseMenuImmediate();
+            return;
+        }
+
         if (menuKey != KeyCode.None && UnityEngine.Input.GetKeyDown(menuKey))
         {
             ToggleMenu();
@@ -284,7 +298,7 @@ public sealed class KeybindBehaviour : MonoBehaviour
         catch (Exception ex)
         {
             Plugin.LogInstance?.LogError($"Keybind UI error (auto-closing safely): {ex}");
-            CloseMenu();
+            ReleaseMenuImmediate();
         }
     }
 
@@ -298,6 +312,10 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
     private void OpenMenu()
     {
+        if (_menuOpen)
+            return;
+
+        _releasingMenu = false;
         _menuOpen = true;
         _menuUi.CancelListening();
 
@@ -312,8 +330,6 @@ public sealed class KeybindBehaviour : MonoBehaviour
             _savedCursorState = true;
             _prevCursorVisible = Cursor.visible;
             _prevCursorLock = Cursor.lockState;
-            if (EventSystem.current != null)
-                _prevEventSystemEnabled = EventSystem.current.enabled;
         }
 
         MaintainMenuCursor();
@@ -325,26 +341,88 @@ public sealed class KeybindBehaviour : MonoBehaviour
             return;
 
         _menuOpen = false;
+        _releasingMenu = true;
+        _menuUi.CancelListening();
+    }
+
+    internal void ForceCloseMenu() => ReleaseMenuImmediate();
+
+    private void ReleaseMenuImmediate()
+    {
+        if (!_menuOpen && !_releasingMenu && !_savedCursorState && _blockedEventSystems.Count == 0)
+            return;
+
+        _menuOpen = false;
+        _releasingMenu = false;
         _menuUi.CancelListening();
         Plugin.SetJsBattlePaused(false);
+
+        for (int i = 0; i < _blockedEventSystems.Count; i++)
+        {
+            var es = _blockedEventSystems[i];
+            try
+            {
+                if (es != null)
+                    es.enabled = true;
+            }
+            catch
+            {
+                // Ignore destroyed EventSystem across scene transitions
+            }
+        }
+        _blockedEventSystems.Clear();
 
         if (_savedCursorState)
         {
             _savedCursorState = false;
-            if (EventSystem.current != null)
-                EventSystem.current.enabled = _prevEventSystemEnabled;
-            Cursor.visible = _prevCursorVisible;
-            Cursor.lockState = _prevCursorLock;
+            try
+            {
+                Cursor.lockState = _prevCursorLock;
+            }
+            catch
+            {
+                // Ignore cursor state cleanup errors on teardown
+            }
+
+            try
+            {
+                Cursor.visible = _prevCursorVisible;
+            }
+            catch
+            {
+                // Ignore cursor visibility cleanup errors on teardown
+            }
         }
     }
 
-    private static void MaintainMenuCursor()
+    private void MaintainMenuCursor()
     {
-        if (EventSystem.current != null && EventSystem.current.enabled)
-            EventSystem.current.enabled = false;
+        var current = EventSystem.current;
+        if (current != null && current.enabled)
+        {
+            current.enabled = false;
+            bool alreadyTracked = false;
+            for (int i = 0; i < _blockedEventSystems.Count; i++)
+            {
+                var existing = _blockedEventSystems[i];
+                if (existing != null && existing.Pointer == current.Pointer)
+                {
+                    alreadyTracked = true;
+                    break;
+                }
+            }
+            if (!alreadyTracked)
+                _blockedEventSystems.Add(current);
+        }
+
         Cursor.visible = true;
         Cursor.lockState = CursorLockMode.None;
     }
+
+    private static bool IsCloseInputHeld(KeyCode menuKey) =>
+        UnityEngine.Input.GetKey(KeyCode.Mouse0)
+        || UnityEngine.Input.GetKey(KeyCode.Escape)
+        || (menuKey != KeyCode.None && UnityEngine.Input.GetKey(menuKey));
 
     private void HandleMenuInput()
     {
@@ -388,7 +466,13 @@ public sealed class KeybindBehaviour : MonoBehaviour
 
     public void OnDisable()
     {
-        CloseMenu();
+        ReleaseMenuImmediate();
+        _sequencer.Cancel(0);
+    }
+
+    public void OnDestroy()
+    {
+        ReleaseMenuImmediate();
         _sequencer.Cancel(0);
     }
 

@@ -81,6 +81,8 @@ public sealed class Plugin : BasePlugin
     {
         try
         {
+            Behaviour?.ForceCloseMenu();
+
             if (__0 == null)
                 return;
 
